@@ -82,6 +82,46 @@ intercept predicate rejects at boot. Generated code also defers to the service
 while a device event is pending or an external interrupt dispatch is live.
 Call-tracing and profiling diagnostics disable the table.
 
+## Laptop session 2026-10-10 (Core Ultra 185H, Arc iGPU, fast-float build, 9 min)
+
+Findings from the user's detailed diagnostics recording and what changed:
+
+- Idle-loop wait oversleep: 117 of the 128 worst checkpoint gaps were at the
+  idle loop (pc 0x804D2668), p50 32.5 ms, minimum 16.9 ms: one or two system
+  clock ticks. `WaitOnAddress` timeouts are quantized to the clock interrupt
+  regardless of `timeBeginPeriod`. Every two-second window had a 50 ms frame
+  production gap and AI DMA completions ran 18 to 32 ms late (54 recovery
+  probes), which is the audio lag heard in cutscenes. Fixed: the idle wait now
+  blocks on an auto-reset event (signaled by every latch publication and PE
+  wake) plus a high-resolution waitable timer, the same mechanism the deadline
+  broker already used; slice 16 ms, guard 500 us.
+- Pointer depth mid-frame FIFO split: 5,687 scene boundaries cost 13.7 s of
+  simulation time (2.4 ms each, 8.7 ms max) plus 15.2 s of render-worker time,
+  because each boundary submitted the partial frame as its own chunk and
+  queued a utility capture. Fixed: the boundary records the FIFO offset and
+  the frame's own submission captures the field when the parser reaches it
+  (`attach_pointer_depth_capture`, `record_pointer_depth_capture_in_frame`),
+  completing at the frame fence.
+- First-use pipeline compiles: 36 misses at 20 to 163 ms each (FXC level 1 is
+  98 percent of it); one frame parsed for 798 ms, which backed the render
+  queue up and stalled the simulation thread 784 ms. Changed: first use
+  compiles with `D3DCOMPILE_SKIP_OPTIMIZATION` and publishes at once; a
+  below-normal worker compiles the level-1 pair, builds and stores the
+  optimized pipeline and replaces the published one (retired pipelines stay
+  alive for frames in flight). Only optimized blobs reach `shaders.bin`.
+  `GALAXY_PSO_FAST_FIRST_COMPILE=0` restores the synchronous level-1 compile.
+  The installer seed cache was refreshed from the development machine's cache
+  (349 keys).
+- Input latency: KPAD sample to Present return measured 59 to 65 ms mean, p95
+  75 to 99 ms, maximum 185 ms. The game's own double buffering accounts for
+  20 to 33 ms; the rest was render queue backlog and the swap-chain queue.
+  `GALAXY_RENDER_QUEUE_DEPTH` 4 to 2 and `GALAXY_SWAP_CHAIN_FRAME_LATENCY`
+  2 to 1 in `installer/runtime-env.json`; to be re-measured.
+- Still open: THP video decode 4 to 6 ms per 640x368 frame on the simulation
+  thread (scalar Huffman reader); texture resource creation 24 to 36 ms per
+  first-use texture (`CreateCommittedResource`); texture-flush descriptor
+  work 20 to 43 ms; one 31.7 ms EFB texture copy.
+
 ## Known simulation-thread stalls (from the 9950X3D A/B telemetry)
 
 - (Resolved, F9 pointer) Keyboard/mouse pointer mode waited for the current
