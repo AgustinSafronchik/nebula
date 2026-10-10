@@ -27,6 +27,8 @@ dispatch. GPU time per frame was under 0.3 ms on an Intel Arc iGPU.
 | F21 | Gather-pipe stores append to the host's live 32-byte burst buffer in place | `GuestMemoryV1::wgpipe_gather_fast` |
 | F22 (part) | Flip-discard swap chain by default | `runtime-env.json`, `render_config.h` |
 | F24 | Idle-loop sleep: with an empty guest run queue the simulation thread waits on the high-resolution timer toward the next VI deadline (AI-capped, 2 ms slices, 250 us guard) instead of spinning a core | `idle_loop_wait_for_next_deadline` |
+| F11 | Decoded packet-run cache entries own GPU-resident vertex blocks (`ResidentVertexArena`); replays no longer re-copy vertices into the ring; dependency snapshots are merged into contiguous spans for validation | `vertex_loader.cpp`, `gx_backend.cpp` |
+| F13 | First-use texture decode on a worker pool against the sealed frame snapshot, joined before submission; SSE2/SSSE3 tile decoders for RGBA8, RGB565, RGB5A3, IA8, I8 | `texture_cache.cpp`, `texture_decode_pool.h` |
 
 Measured on the build host (9950X3D) at a steady 60 fps on the title route:
 the simulation thread fell from 95 to 46 percent of a core and process CPU from
@@ -63,7 +65,7 @@ Call-tracing and profiling diagnostics disable the table.
 | F6 | Checkpoint diet: branch and call-return counters remain; `ensure_fpu_available` remains one MSR test per region |
 | F8 | DSP module codegen at the same standard |
 | F10 | PE tokens at FIFO consumption instead of GPU fence |
-| F11, F12, F13, F14 | Display-list batch cache, compact vertices, worker texture decode, non-blocking pipeline misses (needs a real uber pipeline) |
+| F12, F14 | Compact per-layout vertex stride; non-blocking pipeline misses (needs a real uber pipeline). The remaining texture spikes are resource creation, not decode; placed heaps or recycled resources are the fix |
 | F16 | Working-set investigation (2.8 to 5.4 GB observed) |
 | F17, F18 | Present phase lock to vblank; compile-time removal of remaining runtime trace gates |
 | F20 | Guest threads as fibers instead of exception unwinding |
