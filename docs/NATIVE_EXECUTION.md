@@ -21,7 +21,7 @@ dispatch. GPU time per frame was under 0.3 ms on an Intel Arc iGPU.
 | F2 | Native paired single (ps_add/sub/mul/muls/div, ps_madd family, ps_sum), quantized loads/stores on the flat view | same |
 | F3 | Flat 4 GiB guest view is the default memory model; generated loads and stores address it directly | `native_host.cpp`, translator `flat_ram_reads`/`flat_ram_writes` |
 | F7 | `-mfma` with contraction off so explicit `std::fma` is one instruction on AVX2 hosts | generated `CMakeLists.txt` |
-| F9 | GXPeekZ answered from an asynchronous 640x528 depth field; no FIFO drain or GPU round trip after the first peek | `gx_backend.cpp`, `renderer_d3d12.cpp`, `gx_efb_peek` |
+| F9 | GXPeekZ and GXPeekARGB answered from asynchronous 640x528 depth and color fields (one per peek kind, private resources); no FIFO drain or GPU round trip after the first peek of each kind. Before the color field, 32,851 synchronous color peeks in a five-minute A/B blocked the simulation thread 7.3 s in total (8.1 ms maximum) | `gx_backend.cpp`, `renderer_d3d12.cpp`, `gx_efb_peek` |
 | F15 | Simulation and render threads restricted to performance cores on hybrid CPUs; simulation thread at HIGHEST | `windows_power.h`, `configure_runtime_scheduling` |
 | F19 | `bctrl`/`bclrl` dispatch through a direct native entry table published by the runtime | `native_fast_paths.h`, `build_direct_dispatch_table` |
 | F21 | Gather-pipe stores append to the host's live 32-byte burst buffer in place | `GuestMemoryV1::wgpipe_gather_fast` |
