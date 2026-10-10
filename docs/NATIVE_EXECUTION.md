@@ -117,10 +117,17 @@ Findings from the user's detailed diagnostics recording and what changed:
   20 to 33 ms; the rest was render queue backlog and the swap-chain queue.
   `GALAXY_RENDER_QUEUE_DEPTH` 4 to 2 and `GALAXY_SWAP_CHAIN_FRAME_LATENCY`
   2 to 1 in `installer/runtime-env.json`; to be re-measured.
-- Still open: THP video decode 4 to 6 ms per 640x368 frame on the simulation
-  thread (scalar Huffman reader); texture resource creation 24 to 36 ms per
-  first-use texture (`CreateCommittedResource`); texture-flush descriptor
-  work 20 to 43 ms; one 31.7 ms EFB texture copy.
+- THP video decode ran 4 to 6 ms per 640x368 frame on the simulation thread
+  (12,667 frames in the session). The bit reader assembled up to four bytes
+  per call and the Huffman slow path read one bit at a time; it now keeps a
+  64-bit cache with peek/skip and whole 8x8 blocks are written as 8-byte rows.
+  Decoder tests (bounds, EOF, tiled image) unchanged. To be re-measured.
+- First-use texture resource creation took 24 to 36 ms (`CreateCommittedResource`
+  on the Arc driver), which is also what the 20 to 43 ms "texture-flush"
+  stalls were. Retired decoded textures (GPU-idle at slot reuse, RGBA8 2D) now
+  go to a pool capped at 256 MB (`GALAXY_TEXTURE_POOL_MB`) and a miss of the
+  same size and mip count reuses one with a PSR-to-copy barrier.
+- Still open: one 31.7 ms EFB texture copy; F20 fibers (31 unwinds/s).
 
 ## Known simulation-thread stalls (from the 9950X3D A/B telemetry)
 
