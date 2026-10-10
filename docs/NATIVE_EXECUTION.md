@@ -30,6 +30,7 @@ dispatch. GPU time per frame was under 0.3 ms on an Intel Arc iGPU.
 | F11 | Decoded packet-run cache entries own GPU-resident vertex blocks (`ResidentVertexArena`); replays no longer re-copy vertices into the ring; dependency snapshots are merged into contiguous spans for validation | `vertex_loader.cpp`, `gx_backend.cpp` |
 | F13 | First-use texture decode on a worker pool against the sealed frame snapshot, joined before submission; SSE2/SSSE3 tile decoders for RGBA8, RGB565, RGB5A3, IA8, I8 | `texture_cache.cpp`, `texture_decode_pool.h` |
 | F6 (FPU) | Eager FPU: no MSR[FP] test per region and no exception-7 retry entry per FP instruction. The runtime performs the lazy owner switch of RMGE01's exception-7 handler itself (translated 0x804A3604 save / 0x804A34E0 load, `__OSFPUContext`, SRR1 and MSR[FP]) at OSSetCurrentContext, the OSLoadContext boundary, exception entry and RFI. Interior entries 287,930 to 178,776 | `eager_fpu_context_switch`, translator entry discovery |
+| F5 (integer) | Register residency pass (`crate::residency`): GPRs, LR and CTR are function locals between synchronization points. Every context-receiving call not proven to leave the integer file alone stores the written locals first and reloads after; `call_return_checkpoint` reloads; backward-branch checkpoints split into an inline `branch_checkpoint_due` test and a cold stored/reloaded `branch_checkpoint_taken_counted`; interior entries reload through stubs; every `return` stores. lmw/stmw lower to one statement per register. Unknown helpers are full synchronization points. 25,937 of 41,941 functions resident; the module benchmark (FP-heavy) is unchanged (82.5 to 82.2 ns), the gain is in integer game logic | `residency.rs`, `native_api.h` |
 | F4 | Flush-based dirty tracking: translated stores (scalar, paired, stmw, dcbz) write RAM with no publication; `dcbf`/`dcbst` publish their 32-byte line to both trackers; display-list gather bursts publish on the host. `dcbi`/`icbi` lower to nothing | `native_fast_paths.h` `store`/`dcache_flush_line`, `flush_wgpipe_gather_burst` |
 
 Measured on the build host (9950X3D) at a steady 60 fps on the title route:
@@ -73,7 +74,7 @@ Call-tracing and profiling diagnostics disable the table.
 
 | Item | State |
 | --- | --- |
-| F5 | Register residency beyond straight-line leaves: compiler-driven now that helper calls are inline; the text pass stays off |
+| F5 (float) | FPR/PS1 residency: the native float helpers still read and write `context->fpr_bits`/`ps1_bits` per operation (operand admission, narrowing and commit), which is what keeps the scalar matrix routines at 230-640 ns. Needs array-local overloads of the `fast::scalar_*`/`paired_*`/`psq_*`/`*_fpr_single` helpers with the exact path syncing through `context` |
 | F6 (checkpoints) | Branch and call-return checkpoints remain: counter, watermark and event-mask loads through the services table at every backward branch and call return |
 | F3b | Loads and stores still carry the alias-table range check with a cold checked-path call. Because `context` is captured, LLVM reloads context fields after every such merge; this, not the check itself, is what keeps guest registers out of host registers. Unconditional flat access with a fault handler for MMIO removes the slow paths |
 | F8 | DSP module codegen at the same standard |
