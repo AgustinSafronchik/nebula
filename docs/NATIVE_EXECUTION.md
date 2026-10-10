@@ -127,6 +127,22 @@ Findings from the user's detailed diagnostics recording and what changed:
   stalls were. Retired decoded textures (GPU-idle at slot reuse, RGBA8 2D) now
   go to a pool capped at 256 MB (`GALAXY_TEXTURE_POOL_MB`) and a miss of the
   same size and mip count reuses one with a PSR-to-copy barrier.
+- Simulation thread load on the 185H: 76 percent of one core on average,
+  85 to 93 percent in gameplay windows, 98 percent peaks (threads.csv), so the
+  laptop is close to CPU-bound on that thread even with fast float. Two
+  changes follow from it. Budgeted backward-branch checkpoints (generation
+  15): every translated function keeps a local countdown and runs the
+  checkpoint gate once per `kBranchCheckpointBudget` (32) backward branches
+  (`branch_checkpoint_taken_budgeted`, `branch_checkpoint_due_budgeted`); the
+  gate advances the checkpoint counter by the budget so the count-based
+  schedules keep their calibration. The other iterations cost a decrement and
+  a predicted branch instead of four service loads, a counter store and an
+  atomic load. A built-in sampling profiler (`GALAXY_SIM_PROFILE=1`, on in the
+  shipped runtime-env.json and in the launcher's Detailed recording) suspends
+  the simulation thread once per millisecond and prints `[sim-profile-guest]`
+  (guest function, samples, percent) and `[sim-profile-host]` (runtime image
+  offset, resolved offline against the PDB) at shutdown; the next recorded
+  session says where the remaining time goes.
 - Still open: one 31.7 ms EFB texture copy; F20 fibers (31 unwinds/s).
 
 ## Known simulation-thread stalls (from the 9950X3D A/B telemetry)
