@@ -1,6 +1,6 @@
 # Native execution model
 
-Status of the performance program recorded on 2026-10-09. Items are numbered
+Status of the performance program recorded on 2026-10-10. Items are numbered
 F1 to F23 as in the root-cause analysis. "Shipped" means the change is in this
 tree and takes effect through the normal install (the installer compiles the
 generated module on the user's machine; the runtime ships prebuilt).
@@ -31,6 +31,8 @@ dispatch. GPU time per frame was under 0.3 ms on an Intel Arc iGPU.
 | F13 | First-use texture decode on a worker pool against the sealed frame snapshot, joined before submission; SSE2/SSSE3 tile decoders for RGBA8, RGB565, RGB5A3, IA8, I8 | `texture_cache.cpp`, `texture_decode_pool.h` |
 | F6 (FPU) | Eager FPU: no MSR[FP] test per region and no exception-7 retry entry per FP instruction. The runtime performs the lazy owner switch of RMGE01's exception-7 handler itself (translated 0x804A3604 save / 0x804A34E0 load, `__OSFPUContext`, SRR1 and MSR[FP]) at OSSetCurrentContext, the OSLoadContext boundary, exception entry and RFI. Interior entries 287,930 to 178,776 | `eager_fpu_context_switch`, translator entry discovery |
 | F5 (integer) | Register residency pass (`crate::residency`): GPRs, LR and CTR are function locals between synchronization points. Every context-receiving call not proven to leave the integer file alone stores the written locals first and reloads after; `call_return_checkpoint` reloads; `call_return_checkpoint` is a full synchronization point as well (an inline wrapper can write a register right before it); backward-branch checkpoints split into an inline `branch_checkpoint_due` test and a cold stored/reloaded `branch_checkpoint_taken_counted`; interior entries reload through stubs; every `return` stores. lmw/stmw lower to one statement per register. Unknown helpers are full synchronization points. 25,937 of 41,941 functions resident; the module benchmark (FP-heavy) is unchanged (82.5 to 83.2 ns), the gain is in integer game logic | `residency.rs`, `native_api.h` |
+| F1/F2 (fast float) | Fast float is the release float model (translator `fast_float`, `#define GALAXY_FAST_FLOAT 1` at the top of the generated `functions.h`, generation 14). Every `fast::scalar_*`/`paired_*`/`fctiwz` helper computes natively with no exact fallback: binary64 as written, single forms rounded once to binary32 (`cvtsd2ss`), 25-bit multiplier rounding kept, fmadd family fused, paired singles as one `__m128d` per operand, fctiwz saturating. FPSCR status, NaN payloads and non-nearest rounding are not reproduced. The module exports `galaxy_module_float_flags`; the runtime sets MXCSR FTZ+DAZ on the simulation thread (Gekko non-IEEE mode; `GALAXY_FAST_FLOAT_FTZ_DAZ=0` leaves it). Decided by the user on 2026-10-10 in favour of performance over bit-exactness. Module benchmark 83.2 to 33.4 ns mean per call; matrix routines 0x804B6F90 634 to 50 ns, 0x804B6008 73 to 15 ns, 0x804B6548 298 to 124 ns; 16 float operations compile to 82 instructions and no calls. The exact model stays available (`fast_float: false`); the whole module then carries 33 exact commits (fres/frsqrte) instead of one per float instruction | `native_fast_paths.h` (`fast_float_detail`), translator `apply_fast_float_mode`, `galaxy_native_fast_float_tests` |
+| F9 (pointer) | Mouse pointer depth (`0x80385034`) answers from the previous scene's completed owned depth field (double-buffered `NativeMouseDepthFrame::ready`) instead of waiting for the current scene's GPU readback: 12,229 waits, 11.7 s total and 82 ms maximum in the five-minute A/B. The pointer's screen position is the current sample; its depth is one scene old. `GALAXY_NATIVE_MOUSE_ASYNC_DEPTH=0` restores the wait | `native_runtime.cpp` scene boundary 0x804B9EC8 / transaction 0x80385034 |
 | F4 | Flush-based dirty tracking: translated stores (scalar, paired, stmw, dcbz) write RAM with no publication; `dcbf`/`dcbst` publish their 32-byte line to both trackers; display-list gather bursts publish on the host. `dcbi`/`icbi` lower to nothing | `native_fast_paths.h` `store`/`dcache_flush_line`, `flush_wgpipe_gather_burst` |
 
 Measured on the build host (9950X3D) at a steady 60 fps on the title route:
@@ -52,14 +54,24 @@ Hand-written native substitutions stay disabled for functions that execute FP
 instructions: they use the exact out-of-line float helpers and measured 1.3 to
 3.4x slower than the generic native lowering (0x804B6548 396 to 723 ns).
 
-## Admission rules of the native float path
+## Float models
 
-Inputs finite and zero-or-normal, FPSCR rounding mode nearest-even. Results
-that are non-finite, subnormal, or (single precision) exactly on a binary32
-rounding midpoint take the exact helper, as does every input the rules reject.
-Gekko's 25-bit multiplier rounding is applied to every single-precision
-multiply. The native path does not maintain FPSCR status bits (FPRF, FI, FR,
-sticky exceptions); the exact path and every status consumer still do.
+Fast float (release): plain IEEE binary64 arithmetic on the host, single
+precision as one rounding of the binary64 result to binary32, fused
+multiply-add, 25-bit multiplier rounding, saturating fctiwz, both paired lanes
+in one vector, FTZ+DAZ on the simulation thread. Not reproduced: FPSCR status
+bits, NaN payload/sign propagation, non-nearest rounding modes, binary32
+double-rounding corners. This is the accuracy class of Dolphin's JIT and
+WiiCompiled. fres/frsqrte/ps_res/ps_rsqrte keep the exact table estimates.
+
+Exact (`fast_float: false`), admission rules of the native path: inputs finite
+and zero-or-normal, FPSCR rounding mode nearest-even. Results that are
+non-finite, subnormal, or (single precision) exactly on a binary32 rounding
+midpoint take the exact helper, as does every input the rules reject. The
+native path does not maintain FPSCR status bits; the exact path and every
+status consumer still do. Measured cost of this model: every float instruction
+keeps an out-of-line exact call, and the host compiler spills guest floats
+around each one (FPR residency on top of it measured 87.9 vs 83.2 ns).
 
 ## Direct dispatch rules
 
@@ -72,10 +84,10 @@ Call-tracing and profiling diagnostics disable the table.
 
 ## Known simulation-thread stalls (from the 9950X3D A/B telemetry)
 
-- Keyboard/mouse pointer mode waits for the current frame's owned pointer depth
-  field before the pointer transaction (`0x80385034`) completes; one 82 ms
-  checkpoint gap during a load was this wait. The asynchronous peek fields
-  (one frame of staleness) are the model to move it to.
+- (Resolved, F9 pointer) Keyboard/mouse pointer mode waited for the current
+  frame's owned pointer depth field before the pointer transaction
+  (`0x80385034`) completed; one 82 ms checkpoint gap during a load was this
+  wait. The transaction now reads the previous scene's field.
 - Thread switches unwind the native stack through `GuestTransfer` and resume in
   flat continuation mode (about 31 per second in gameplay); F20 replaces this.
 
@@ -83,7 +95,7 @@ Call-tracing and profiling diagnostics disable the table.
 
 | Item | State |
 | --- | --- |
-| F5 (float) | FPR/PS1 residency: the native float helpers still read and write `context->fpr_bits`/`ps1_bits` per operation (operand admission, narrowing and commit), which is what keeps the scalar matrix routines at 230-640 ns. Needs array-local overloads of the `fast::scalar_*`/`paired_*`/`psq_*`/`*_fpr_single` helpers with the exact path syncing through `context` |
+| F5 (float) | FPR/PS1 residency is implemented (`guest_resident_float`, `_r` helper overloads on `fpr[32]`/`ps1[32]` locals) and off: under the exact model it measured 86.8 (store-all) and 87.9 ns (written-only) against 83.2 without it, because the exact fallback calls force spills. To be re-measured on top of fast float, where the float helpers make no calls |
 | F6 (checkpoints) | Branch and call-return checkpoints remain: counter, watermark and event-mask loads through the services table at every backward branch and call return |
 | F3b | Loads and stores still carry the alias-table range check with a cold checked-path call. Because `context` is captured, LLVM reloads context fields after every such merge; this, not the check itself, is what keeps guest registers out of host registers. Unconditional flat access with a fault handler for MMIO removes the slow paths |
 | F8 | DSP module codegen at the same standard |
@@ -96,8 +108,10 @@ Call-tracing and profiling diagnostics disable the table.
 
 ## Verification
 
-`cargo test --workspace` for the translator; the runtime test targets compile
-against ABI 24; a smoke run of the intro route on the build host boots,
+`cargo test --workspace` for the translator (424 tests; the temp-directory
+tests need a writable `%TEMP%`); the runtime test targets (60, including
+`galaxy_native_fast_float_tests` built with `GALAXY_FAST_FLOAT=1`) compile
+against ABI 25; a smoke run of the intro route on the build host boots,
 publishes the direct dispatch table, and answers depth peeks from the field.
 Differential register tracing against Dolphin remains the gate for any change
 to the admission rules above.
