@@ -26,7 +26,7 @@ dispatch. GPU time per frame was under 0.3 ms on an Intel Arc iGPU.
 | F19 | `bctrl`/`bclrl` dispatch through a direct native entry table published by the runtime | `native_fast_paths.h`, `build_direct_dispatch_table` |
 | F21 | Gather-pipe stores append to the host's live 32-byte burst buffer in place | `GuestMemoryV1::wgpipe_gather_fast` |
 | F22 (part) | Flip-discard swap chain by default | `runtime-env.json`, `render_config.h` |
-| F24 | Idle-loop sleep: with an empty guest run queue the simulation thread waits on the high-resolution timer toward the next VI deadline (AI-capped, 2 ms slices, 250 us guard) instead of spinning a core | `idle_loop_wait_for_next_deadline` |
+| F24 | Idle-loop wait, on by default: with an empty guest run queue the simulation thread blocks on the deadline latch's event mask (`WaitOnAddress`) instead of spinning a core. Every latch publication (VI, AI, DEC, input, DSP, IOS) and every PE finish/token raised by the render thread wakes it; the timeout is bounded by the next VI deadline, the AI DMA deadline and a 4 ms slice with a 250 us guard, so a missed wake cannot delay a device edge beyond the existing polling. `GALAXY_IDLE_LOOP_SLEEP=0` restores the spin. The earlier timer-slice version was opt-in after a laptop session failed the exact VI cadence check; the event-driven wait wakes at publication, which is when the spinning loop would have observed the edge | `idle_loop_wait_for_next_deadline`, `PendingEventLatch::wake_idle_waiters` |
 | F11 | Decoded packet-run cache entries own GPU-resident vertex blocks (`ResidentVertexArena`); replays no longer re-copy vertices into the ring; dependency snapshots are merged into contiguous spans for validation | `vertex_loader.cpp`, `gx_backend.cpp` |
 | F13 | First-use texture decode on a worker pool against the sealed frame snapshot, joined before submission; SSE2/SSSE3 tile decoders for RGBA8, RGB565, RGB5A3, IA8, I8 | `texture_cache.cpp`, `texture_decode_pool.h` |
 | F6 (FPU) | Eager FPU: no MSR[FP] test per region and no exception-7 retry entry per FP instruction. The runtime performs the lazy owner switch of RMGE01's exception-7 handler itself (translated 0x804A3604 save / 0x804A34E0 load, `__OSFPUContext`, SRR1 and MSR[FP]) at OSSetCurrentContext, the OSLoadContext boundary, exception entry and RFI. Interior entries 287,930 to 178,776 | `eager_fpu_context_switch`, translator entry discovery |
@@ -69,6 +69,15 @@ address the cached-call service compares against, and any target the live
 intercept predicate rejects at boot. Generated code also defers to the service
 while a device event is pending or an external interrupt dispatch is live.
 Call-tracing and profiling diagnostics disable the table.
+
+## Known simulation-thread stalls (from the 9950X3D A/B telemetry)
+
+- Keyboard/mouse pointer mode waits for the current frame's owned pointer depth
+  field before the pointer transaction (`0x80385034`) completes; one 82 ms
+  checkpoint gap during a load was this wait. The asynchronous peek fields
+  (one frame of staleness) are the model to move it to.
+- Thread switches unwind the native stack through `GuestTransfer` and resume in
+  flat continuation mode (about 31 per second in gameplay); F20 replaces this.
 
 ## Not yet shipped
 
