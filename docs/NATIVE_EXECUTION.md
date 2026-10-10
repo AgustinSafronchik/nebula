@@ -29,6 +29,8 @@ dispatch. GPU time per frame was under 0.3 ms on an Intel Arc iGPU.
 | F24 | Idle-loop sleep: with an empty guest run queue the simulation thread waits on the high-resolution timer toward the next VI deadline (AI-capped, 2 ms slices, 250 us guard) instead of spinning a core | `idle_loop_wait_for_next_deadline` |
 | F11 | Decoded packet-run cache entries own GPU-resident vertex blocks (`ResidentVertexArena`); replays no longer re-copy vertices into the ring; dependency snapshots are merged into contiguous spans for validation | `vertex_loader.cpp`, `gx_backend.cpp` |
 | F13 | First-use texture decode on a worker pool against the sealed frame snapshot, joined before submission; SSE2/SSSE3 tile decoders for RGBA8, RGB565, RGB5A3, IA8, I8 | `texture_cache.cpp`, `texture_decode_pool.h` |
+| F6 (FPU) | Eager FPU: no MSR[FP] test per region and no exception-7 retry entry per FP instruction. The runtime performs the lazy owner switch of RMGE01's exception-7 handler itself (translated 0x804A3604 save / 0x804A34E0 load, `__OSFPUContext`, SRR1 and MSR[FP]) at OSSetCurrentContext, the OSLoadContext boundary, exception entry and RFI. Interior entries 287,930 to 178,776 | `eager_fpu_context_switch`, translator entry discovery |
+| F4 | Flush-based dirty tracking: translated stores (scalar, paired, stmw, dcbz) write RAM with no publication; `dcbf`/`dcbst` publish their 32-byte line to both trackers; display-list gather bursts publish on the host. `dcbi`/`icbi` lower to nothing | `native_fast_paths.h` `store`/`dcache_flush_line`, `flush_wgpipe_gather_burst` |
 
 Measured on the build host (9950X3D) at a steady 60 fps on the title route:
 the simulation thread fell from 95 to 46 percent of a core and process CPU from
@@ -36,7 +38,18 @@ the simulation thread fell from 95 to 46 percent of a core and process CPU from
 asynchronous field (F9); the direct dispatch table published 326,540 entries
 and withheld 3,331 (F19).
 
-Native ABI is 24; generation version is 12. Every module must be regenerated.
+Module benchmark (`bench_module`, SDK matrix library, 36 functions, 9950X3D):
+mean 103.4 ns per call at ABI 24, 82.5 at ABI 25 with F6 and F4. Store-heavy
+routines 2 to 3x (PSMTXIdentity 32.7 to 12.2, PSMTXCopy 39.6 to 18.1,
+0x804B6328 247.7 to 155.6); scalar routines 0x804B6F90 and 0x804B6DC4 remain
+at 638 and 233 ns, bound by context memory traffic and the load/store slow
+paths (see below).
+
+Native ABI is 25; generation version is 13. Every module must be regenerated.
+
+Hand-written native substitutions stay disabled for functions that execute FP
+instructions: they use the exact out-of-line float helpers and measured 1.3 to
+3.4x slower than the generic native lowering (0x804B6548 396 to 723 ns).
 
 ## Admission rules of the native float path
 
@@ -60,9 +73,9 @@ Call-tracing and profiling diagnostics disable the table.
 
 | Item | State |
 | --- | --- |
-| F4 | Flush-based dirty tracking: per-store page publication remains (inline, one atomic OR per new page) |
 | F5 | Register residency beyond straight-line leaves: compiler-driven now that helper calls are inline; the text pass stays off |
-| F6 | Checkpoint diet: branch and call-return counters remain; `ensure_fpu_available` remains one MSR test per region |
+| F6 (checkpoints) | Branch and call-return checkpoints remain: counter, watermark and event-mask loads through the services table at every backward branch and call return |
+| F3b | Loads and stores still carry the alias-table range check with a cold checked-path call. Because `context` is captured, LLVM reloads context fields after every such merge; this, not the check itself, is what keeps guest registers out of host registers. Unconditional flat access with a fault handler for MMIO removes the slow paths |
 | F8 | DSP module codegen at the same standard |
 | F10 | PE tokens at FIFO consumption instead of GPU fence |
 | F12, F14 | Compact per-layout vertex stride; non-blocking pipeline misses (needs a real uber pipeline). The remaining texture spikes are resource creation, not decode; placed heaps or recycled resources are the fix |
