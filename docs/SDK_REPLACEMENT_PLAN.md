@@ -271,6 +271,19 @@ then reads (`JASDriver::readDspBuffer` 804945CC) and finishes
 (`JASDriver::finishDSPFrame` 804946E8). The DSP and its microcode are an
 implementation detail below that interface.
 
+Why this is the fastest option (the choice criterion is speed with no
+emulation; bit-exact output is not required):
+
+| Option | What still runs | Simulation-thread cost | Other cost |
+| --- | --- | --- | --- |
+| Today: compiled DSP program on a worker | the DSP program, mailbox handshake, MRAM/ARAM transfers | measured: mailbox spin about 2.5 %, MRAM notifies about 2 %, register faults | a worker thread (probably one of the 17 % threads) |
+| DSP microcode handler on the host | command-list parsing, mail protocol, transfer staging | the game still builds DSP command lists and exchanges mails every frame | same mixing work plus protocol work: emulation, rejected |
+| Host mixer at the JAudio driver interface (chosen) | the game's JAudio code that sets voice parameters (game logic) | no mails, no command lists, no transfers: the driver calls become plain host calls | mixing on the audio output thread, AVX2 over 8 voices at a time |
+| Reimplementing JAudio itself (sequencer, banks) | nothing of the game's audio code | removes the game's own parameter updates too | a rewrite of the game's audio engine for a small remaining share; not worth it unless a profile shows JAudio game code in the top entries |
+
+The chosen level removes everything below the game's own audio logic and
+moves all sample work off the simulation thread.
+
 The native replacement mixes those voices on the host directly:
 
 1. Replace `JASDriver::updateDSP`, `readDspBuffer` and `finishDSPFrame`,
@@ -293,6 +306,11 @@ The native replacement mixes those voices on the host directly:
    other JSystem decompilations) documents every field and every value the
    game writes. That is the specification: what the game asks for, not how
    a DSP program implements it.
+2b. Speed: mix on the audio output thread only; decode ADPCM once per
+   sample block into a per-voice decoded cache (looping sounds reuse it);
+   resample and mix eight voices per AVX2 lane group into float buses;
+   convert to 16-bit or float output once per frame. The simulation
+   thread's only audio work is the game's own JAudio parameter code.
 3. ADPCM decoding is the standard GameCube/Wii DSP-ADPCM format (4-bit
    nibbles, 8 coefficient pairs per sample header, predictor/scale byte
    per 8-byte frame); the coefficients are in each sample's header the
@@ -314,8 +332,9 @@ The native replacement mixes those voices on the host directly:
    RMS per 5 ms frame (tolerance, not bit-exactness), and listen to the
    title theme, a stage, and a cutscene.
 
-What this removes: the DSP worker thread (17 percent of a core on the
-laptop), the mailbox spin (2.5 percent of the simulation thread), MRAM
+What this removes: the DSP worker thread (probably one of the two 17
+percent threads on the laptop; unconfirmed until threads are named), the
+mailbox spin (2.5 percent of the simulation thread), MRAM
 transaction notifies (2 percent), the DSP and ARAM register faults,
 `poll_native_dsp`, the AI DMA deadline emulation, and the compiled DSP
 module.

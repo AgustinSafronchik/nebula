@@ -58,12 +58,37 @@ thread switch path) 6 %, `0x803812C4` 3 %, `0x8048362C` 2.7 %,
 Conclusion: at 480p the 185H already produces 60 new frames per second in
 gameplay windows; what remains on that machine is stutter (timer
 oversleeps, video decode waits, worker-thread crash) and headroom. The
-6th-generation i7 target has roughly 45 to 55 percent of the 185H's
-single-thread throughput, so the simulation thread must shrink by more than
-2x to hold 60 there with margin. The breakdown says where: the interrupt
+6th-generation i7 target is slower per thread than the 185H by an amount
+not yet measured (an estimate is about half); the simulation thread must
+shrink substantially to hold 60 there, and the exact factor must come from
+a recording on that machine. The breakdown says where: the interrupt
 and thread-switch machinery (14 %), the checkpoint and timing substrate
 (5 to 8 %), the DSP coprocessor handshake (3 to 5 %), the syscall leftovers
 (5 %), and only then the guest code itself.
+
+## 0b. Evidence ledger
+
+Every number in this document falls into one of three classes. Treat the
+third as something to verify before building on it.
+
+| Claim | Class | Source |
+| --- | --- | --- |
+| Simulation thread 61 % of a core on the 185H (480p and 1080p) | measured | `threads.csv`, recordings 030107 and 025642 |
+| Running-sample split guest 45 %, host 26 %, foreign 29 % | measured | `[sim-profile]` buckets, recording 030107 |
+| Exception unwinding about 14 % of running samples | measured | `[sim-profile-other-caller]` rows for `return_from_interrupt` and `dispatch_decrementer` plus its catch funclet, divided by running samples |
+| `GetAsyncKeyState` 2.3 %, `GetThreadTimes` 0.9 %, `strchr` 0.8 % | measured | `[sim-profile-other]` / `-other-caller` |
+| 33 thousand checkpoint bodies per second | measured | `[host-census]` |
+| Faults 3.2 million to 327 thousand per 120 s title screen | measured | `[fastmem]`, desktop smokes |
+| Stutters are idle-wait oversleeps of 20 to 105 ms | measured | `[checkpoint-gap-record]` (previous pc 0x804AB360, current pc 0x804A87BC) |
+| Repeated presents 5.5 % at 480p, 11.1 % at 1080p | measured | `[gx-stats]` |
+| THP decode 2.5 to 2.8 ms per frame, wait 2.0 to 2.3 ms | measured | `[thp-hle-video-join]` |
+| Working set up to 5.3 GB | measured | `process.csv` |
+| The second 17 % thread is the DSP worker | NOT KNOWN | threads are unnamed; two threads run at 17 %, one is the render thread. P0 step 2 (thread names) settles it |
+| CPU/GPU serialization causes high-resolution lag | hypothesis from code, partly supported | P1.5 (repeated presents double; no GPU timestamps yet) |
+| Idle oversleeps come from missing timer-resolution and power-throttling settings | hypothesis from code and Windows documentation | the runtime never calls `timeBeginPeriod` or `SetProcessInformation(ProcessPowerThrottling)`; confirm with a recording after P5 |
+| The worker-thread crash is a destroyed synchronization object or heap block | hypothesis from the faulting instruction | needs the minidump (P0) |
+| A 6th-generation i7 has about half the 185H's single-thread speed | estimate, not measured | must be measured on the target machine |
+| Gains quoted per item ("10 to 14 %", "25 to 40 %") | derived from the measured shares they remove | true gains only after the item ships and is recorded |
 
 ## 1. Why WiiCompiled is faster, and what to copy
 
@@ -292,8 +317,9 @@ other-caller rows disappearing.
 
 ### P3. Native JAudio mixer instead of the DSP coprocessor
 
-Evidence: the DSP worker is the second-busiest thread on the laptop (17 %
-of a core); the simulation thread spends 2.5 % spinning in
+Evidence: one of the two threads at 17 % of a core on the laptop is
+probably the DSP worker (not yet confirmed: threads are unnamed); the
+simulation thread spends 2.5 % spinning in
 `read_device+0x8a0` waiting for the worker to take a mail and 2 % notifying
 MRAM transactions, and takes the remaining mailbox and ARAM faults.
 
@@ -416,12 +442,35 @@ The chain for every frame today:
    chain (`wait_for_frame_latency_if_needed`, latency 1), with a render
    queue depth of 2.
 
-So per frame the time is simulation + render-thread recording + GPU
-execution + present wait, in series. At 480p the sum fits in 16.7 ms; at
-1440p the GPU part grows and the sum overflows, while each component is
-idle most of the frame, which is exactly 30 percent GPU and 9 percent CPU.
+Hypothesis (from the code above, not yet measured): the game's next frame
+cannot start until the GPU has finished the previous one, so the GPU's
+execution time adds to the frame time instead of overlapping with CPU
+work, and higher internal resolution (more GPU time per frame) pushes the
+sum past 16.7 ms while both processors are partly idle.
+
+Measured support: presents that repeated an old frame were 628 of 11,362
+(5.5 %) at 480p and 1,297 of 11,700 (11.1 %) at 1080p (`[gx-stats]
+xfb-repeated-or-stale-serial-requests`), with the simulation thread at 61
+percent of a core in both runs. The user observed about 30 percent iGPU
+and 9 percent CPU at 1440p with heavy lag (Task Manager, not recorded).
+
+Not measured: GPU execution time per frame, the time from FIFO handoff to
+fence completion, and how long the game's main loop waits on the finish
+flag. The recordings print `render-ms=0` (GPU timestamps are not
+collected). Step 0 below must run before the fix is judged.
 
 Fix (native, no device emulation):
+0. Measure first. Add D3D12 timestamp queries at the start and end of each
+   frame's command list (`ID3D12GraphicsCommandList::EndQuery` with
+   `D3D12_QUERY_TYPE_TIMESTAMP`, resolved into a readback buffer, converted
+   with `ID3D12CommandQueue::GetTimestampFrequency`) and log per frame:
+   FIFO handoff time, render-thread record time, GPU execution time,
+   fence-signal time, the time the game's finish flag was set, and the
+   time the next frame's first FIFO write arrived. Record at 480p, 1080p
+   and 1440p on the 185H. The hypothesis is confirmed if the gap between
+   fence signal and next-frame start is near zero while GPU execution
+   grows with resolution; it is refuted if the next frame starts before
+   the previous frame's fence signals.
 1. Complete PE finish and PE tokens when the render thread has consumed
    the FIFO (the CPU side of the frame is recorded and every guest-memory
    read for it has happened), not when the GPU finishes. With live render
