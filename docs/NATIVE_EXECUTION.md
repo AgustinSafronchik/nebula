@@ -321,14 +321,43 @@ simulation thread with MMCSS Games, all at the top of `wmain` since the first
 public snapshot. The laptop's 20 to 105 ms idle-loop gaps happened with all of
 that active, so their cause is elsewhere.
 
+## Native12/13 session 2026-10-11
+
+All figures: 9950X3D, gameplay route, OS thread times from the external
+sampler unless noted; same package and module on both sides of each A/B.
+
+| Item | Change | Measured |
+| --- | --- | --- |
+| F20 flag transfer (Native12, default on) | `GALAXY_FLAG_TRANSFER=1` lost the Wii Remote (Nunchuk error screen). Bisected with `GALAXY_FLAG_TRANSFER_KINDS` (1 thread switch, 2 external, 4 decrementer): only external-interrupt flag returns broke it, and DEC dispatches fell from ~25,000 to 40 in 16 s. A DEC was delivered between `[flag-set]` and `[flag-take]`: `arbitrate_external_before_decrementer` ran the VI handler, whose RFI set the pending transfer, returned false, and `dispatch_decrementer` accepted DEC on the abandoned boundary; the alarm queue stopped re-arming DEC, so the 500 Hz BTU alarm never ran again. Arbitration now owns the boundary when a transfer is pending; SelectThread's RFI-return proof, the OSLoadContext RFI return and the yield retention catch return on a pending transfer; a guest RFI while one is pending is a RuntimeFailure | simulation thread 26.2 to 20.6 % of a core; 45 HCI commands in both modes; route, Home menu and 240 s title idle with exception-unwinds=0 |
+| EFB fields in place | Every completed pointer-depth field (about 40/s) and GXPeek field was converted into a 1.35 MB array on the render thread so a reader could take one pixel: 24 % of its running samples, stalled on loads from the mapped readback (a pshufb conversion and a pinned mapping did not move it). Pointer fields rotate through four persistently mapped readbacks and GXPeek fields through three per kind; readers convert their pixel | render thread 13.89/14.64 to 12.42/10.11 cpu-s (2 rounds) |
+| Hybrid uber pipelines (Native13, `GALAXY_GX_UBER=1`) | Every first-seen material compiled FXC shaders and a PSO on the render thread (30 to 376 ms record spans with a fresh cache: every VI gap above 25 ms on the route). `uber_vs.hlsl`/`uber_ps.hlsl` run the specialized generator's arithmetic with key decisions read at run time; the key rides in constant-buffer fields specialized shaders never read, so the root signature and cached pipelines are unchanged. A miss draws with its render state's uber pipeline while a worker compiles the specialization. Uber pipelines for the 64 RMGE01 render states seen in complete play caches, in every output variant, build in the background once the uber DXBC exists (cached in `uber.bin`). `force` draws everything with uber pipelines | fresh cache: VI gaps above 25 ms 10 to 1, worst record span 376 to 52 ms, synchronous misses 104 to 11 (8 before the uber DXBC was ready); second session: none. Force mode: route renders correctly with 59 pipelines; strap screens pixel-identical to specialized (0 of 409,920 pixels) |
+| Profiler | `GALAXY_RENDER_PROFILE=1` samples the render thread; both profilers print per-function totals (`*-host-fn`, `*-other-fn`, `*-other-caller-fn`). The runtime's static libraries now carry private symbols: before, samples in their static functions resolved to the nearest public name (the vertex decoder appeared as an `unordered_map` method) | names verified against disassembly |
+
+Simulation thread after F20 (profile, gameplay route, running samples):
+guest code 54 %, runtime 31 %, system 15 %. Largest runtime items: the
+sim-thread PE classifier's FIFO parse (about 5 %), time-base reads (about
+4 %: two CAS loops on shared atomics per read, about 144,000 reads/s),
+MMIO reads and fastmem faults, guest-write drain, checkpoints, DSP mailbox
+wakes, deadline-broker wakes on every DEC write. Render thread after the
+readback change: system/driver 47 % (about a fifth of it first-use shader
+compilation in fresh-cache runs), FIFO parse and display-list replay 17 %,
+CPU vertex decode 13 %, draw-state building 12 %.
+
+Measurement notes: present snapshots need an existing directory; nrun
+`-ShaderCache` seeds a session with a pipeline cache (a returning player);
+gameplay frames are not deterministic across runs, so pixel comparisons
+are limited to static screens. Headless runs have no audio endpoint (the
+runtime keeps starting audio-recovery threads) and no DXGI frame
+statistics; display pacing needs a recording from a real display.
+
 ## Known simulation-thread stalls (from the 9950X3D A/B telemetry)
 
 - (Resolved, F9 pointer) Keyboard/mouse pointer mode waited for the current
   frame's owned pointer depth field before the pointer transaction
   (`0x80385034`) completed; one 82 ms checkpoint gap during a load was this
   wait. The transaction now reads the previous scene's field.
-- Thread switches unwind the native stack through `GuestTransfer` and resume in
-  flat continuation mode (about 31 per second in gameplay); F20 replaces this.
+- (Resolved, F20) Thread switches and interrupt returns unwound the native
+  stack through `GuestTransfer`; generation-17 modules now return by flag.
 
 ## Not yet shipped
 
@@ -341,7 +370,7 @@ that active, so their cause is elsewhere.
 | F12, F14 | Compact per-layout vertex stride; non-blocking pipeline misses (needs a real uber pipeline). The remaining texture spikes are resource creation, not decode; placed heaps or recycled resources are the fix |
 | F16 | Working-set investigation (2.8 to 5.4 GB observed) |
 | F17, F18 | Present phase lock to vblank; compile-time removal of remaining runtime trace gates |
-| F20 | Guest threads as fibers instead of exception unwinding (GuestTransfer unwinds measured about 0.6 percent of simulation-thread samples on the desktop) |
+| F20 | Flag returns shipped (Native12). Guest threads as fibers remain the next step of the SDK replacement plan |
 | F23 | Native SIMD Yaz0 |
 
 ## Verification
