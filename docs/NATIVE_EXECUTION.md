@@ -445,6 +445,16 @@ simulation-thread CPU):
   flag-transfer check (boot failed with an RFI during a pending
   transfer). Generation 18 has to keep a one-load transfer test after
   calls.
+- Call-return checkpoints reduced to that transfer test (module 307 MB,
+  backward-branch checkpoints kept): simulation thread 21.7/21.4 to
+  21.3/21.1 % of a core, checkpoint bodies -25 %, route and audio normal.
+  The inline call-return check costs about 1 to 2 % of the simulation
+  thread on this CPU.
+- Also dropping backward-branch checkpoints (interrupts only at runtime
+  host calls, waits and `mtmsr`) hangs at boot with the simulation thread
+  spinning: a guest loop waits for an interrupt with no polling point.
+  Generation 18 needs the host idle loop / SelectThread and explicit
+  spin-wait handling before branch checkpoints can go.
 
 ## Known simulation-thread stalls (from the 9950X3D A/B telemetry)
 
