@@ -534,7 +534,6 @@ simulation thread 36.3 to 19.8 %, render 15.5 to 9.7 %, repeated frames
 | Idle | No runnable thread: the host runs the checkpoint body at the SDK idle-loop pc (sleep toward the next deadline, then service). The AI-DMA probe is tested by time there (the checkpoint-count probe never advances while no guest code runs); inside the AI margin the pass spins up to 20 us on the event latch, PE levels and the AI deadline | idle passes 5.3 M to 61 k per run; AI-DMA service lateness mean 240 to 103 us (exception path 83 us) |
 | Frame boundary | A delivery that readies a higher-priority thread ends a blocked thread's PE wait so that thread runs; the blocked thread re-enters the wait before it runs guest code again (the exception path resumed it only inside the wait) | |
 | Home Button sidecar | A tail call (b or bctr) whose callee returned continues at the link register instead of ending the call; a return above the call's entry frame leaves the call and the runtime resumes it from the flat chain. Both were masked by the exception path's flat transfers | Home menu route above; 400 outer returns per open |
-
 | Quiet interrupt re-enable | `GALAXY_QUIET_ARCHITECTURE_CHECKPOINTS` now defaults on: an `mtmsr` that sets EE at OSEnableInterrupts/OSRestoreInterrupts (0x804A8104/0x804A8128) returns without the checkpoint body when no event is latched, no device level is raised, every absolute deadline (VI, DEC, AI-DMA, HID) is in the future and the inline schedule is not due. A census before the change: 0x804A8128 alone was 2.56 M of the full checkpoint callbacks in 90 s (about 75 %) | cooperative path, 4 rounds: simulation thread 16.8/16.2/15.4/16.0 to 15.1/15.4/14.4/16.0 %; checkpoint bodies 3.48 M to 1.25 M per run; AI-DMA lateness unchanged (about 96 us mean) |
 | Defaults | `GALAXY_COOP` defaults on when the module reports host-routed SelectThread (`kModuleTransferFlagHostSelectThread`, generation 18); older modules keep the exception-transfer scheduler. `GALAXY_COOP=0` selects it explicitly | scenarios with defaults: gameplay route, Home menu open/close, fresh boot to file select (150 s), title idle (240 s): no failures, 59.88 to 59.94 new frames/s, repeats only at boot |
 
@@ -548,6 +547,18 @@ about 2.8 %.
 
 Not adopted: an idle spin without the time-based AI probe (5.6 M to 5.3 M
 idle passes: the AI deadline stayed due, so the spin returned at once).
+
+## Native22 session 2026-10-11: TVec3 bodies, lean call contracts (generation 19)
+
+| Item | Change | Measured |
+| --- | --- | --- |
+| Tier-3 lean bodies | 30 JGeometry/JMath routines get host bodies (`lean_tvec3_*`, `lean_jmath_ps_copy12/16`, `lean_jgeom_sqrt/inv_sqrt`; JMathInlineVEC::PSVECSubtract reuses `lean_psvec_subtract`): TVec3 copy, `+=`, `-=`, by-value `+`/`-`/`*` (the original's copy-first order kept for aliased operands), scale, negate, splat, set, zero, int constructor, dot, squared, squared distance; TUtil sqrt/inv_sqrt use the host square root instead of frsqrte plus one Newton step. Four of them (zero, copy constructor, `+=`, set) were on the restart-sensitive list only because of exception 7, which eager FPU removed | `bench/diff_tvec3.cpp` against generation 18, 20,000 trials each including aliased and overlapping operands: 0 mismatches; bit-identical except TUtil sqrt/inv_sqrt (last bits, at most 1.9e-7 relative). Profile share before: 1,301 of 19,385 module samples (6.7 %) |
+| Lean call contracts | Each lean body declares the resident registers it reads and writes (`lean_call_contract`, checked against the C++ bodies by `lean_call_contracts_cover_the_bodies`). A call site stores only those registers and reloads only the written ones, and has no call-return checkpoint (the body is a leaf with no checkpoint, callback or transfer). The exact paired-single GXLoadPosMtxImm helper keeps the full boundary | the harness also runs each lean body with every register outside its contract poisoned: same results, untouched registers. Generated source 572 to 552 MB, module 382 to 377 MB |
+
+Gameplay route A/B (generation 18 vs 19, same runtime, 3 rounds):
+simulation thread 16.2/16.3/16.1 to 15.3/15.7/14.0 % of a core (mean 16.2
+to 15.0, lower in every pair); checkpoint bodies 1.27 M to 1.09 M per run;
+60.0 new frames/s and no repeats on both.
 
 ## Known simulation-thread stalls (from the 9950X3D A/B telemetry)
 
