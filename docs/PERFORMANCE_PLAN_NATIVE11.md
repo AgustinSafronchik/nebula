@@ -67,6 +67,10 @@ and thread-switch machinery (14 %), the checkpoint and timing substrate
 
 ## 1. Why WiiCompiled is faster, and what to copy
 
+The subsystem-by-subsystem replacement design, with every SDK function
+address, is `docs/SDK_REPLACEMENT_PLAN.md`; the SDK inventory is
+`docs/sdk/RMGE01_SDK_FUNCTIONS.txt`.
+
 Researched 2026-10-11 from github.com/patchzyy/Wiicompiled (GPLv3; Nebula
 already adapts some of its code with attribution, keep doing that):
 
@@ -286,7 +290,12 @@ the laptop (the unwinder share), measured by `[transfer] exception-unwinds`
 going to zero and the `return_from_interrupt`/`dispatch_decrementer`
 other-caller rows disappearing.
 
-### P3. AX audio HLE instead of the DSP coprocessor
+### P3. Audio HLE instead of the DSP coprocessor (JAudio/Zelda ucode, not AX)
+
+Correction from the symbol table: RMGE01 uses JAudio with the Zelda-family
+DSP ucode (`DSPSendCommands2__FPUlUlPFUs_v` 804962C0, `DSPCallback__14JASAudioThreadFPv`
+80494CC0), not AX. The host replacement is Dolphin's `ZeldaUCode` HLE
+(SMG variants), as laid out in `docs/SDK_REPLACEMENT_PLAN.md` section 4.
 
 Evidence: the DSP worker is the second-busiest thread on the laptop (17 %
 of a core, thread id 33760/20916 in the recordings); the simulation thread
