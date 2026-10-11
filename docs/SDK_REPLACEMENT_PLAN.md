@@ -177,6 +177,12 @@ Design:
    the retrace queue until `retraceCount` changes (the idle loop then
    waits on the host clock with `SleepPreciselyUntil`: a high-resolution
    waitable timer to within 1 ms, then a 300 to 500 us spin).
+   Game-side users to keep correct: `waitForRetrace__17MainLoopFrameworkFv`
+   8039FEE0, `preRetraceProc__8JUTVideoFUl` 80419308,
+   `postRetraceProc__8JUTVideoFUl` 80419554, `waitRetraceIfNeed__8JUTVideoFv`
+   80419618 (JUTVideo installs the pre/post retrace callbacks and swaps the
+   XFB inside them; the runtime's existing JUT XFB manager handling at
+   0x806A2868 documents the fields).
 4. Frame pacing and presentation: the XFB the game set with
    `VISetNextFrameBuffer` + `VIFlush` is what the renderer presents at the
    retrace boundary (the renderer already keeps XFB textures by address:
@@ -296,6 +302,31 @@ Design:
    only audio work is the game's own JAudio frame (voice allocation,
    command list construction), which is game code.
 
+Ucode facts (Dolphin `Source/Core/Core/HW/DSPHLE/UCodes/Zelda.cpp`,
+GPL-2.0-or-later, read 2026-10-11): Super Mario Galaxy, SMG2 and Donkey
+Kong Jungle Beat Wii share Zelda ucode CRC `0xD643001F` with flags
+`NO_ARAM | MAKE_DOLBY_LOUDER | COMBINED_CMD_0D`. It uses the standard (not
+light) protocol: init pushes `DSP_INIT` then `0xF3551111`; a non-control
+mail's low 16 bits give the count of command words that follow; command
+`0x01` sets voices per frame, the VPB base, resampling coefficients, const
+patterns, sine table, AFC coefficients and reverb PB base; command `0x02`
+starts rendering `(cmd >> 16) & 0xFF` frames with an output volume and
+left/right output buffer addresses (plus two discarded words under
+`COMBINED_CMD_0D`); command `0x0E` sets the ARAM base (sound data comes by
+MRAM DMA because of `NO_ARAM`); sync mails carry 16-voice skip masks
+(`m_sync_max_voice_id = (((mail >> 16) & 0xF) + 1) << 4`); each rendered
+frame acks `0xF3550000 | (0xFF00 | frame)` and the batch ends with
+`DSP_FRAME_END`. Mixing buffers are 0x50 samples. Port `ZeldaUCode`,
+`ZeldaAudioRenderer` and the AFC/PCM decoders for this flag set only; the
+game-side glue is `DspBoot__FPFPv_v` 804961E0, `DspInitWork__Fv` 804963E0,
+`DspStartWork__FUlPFUs_v` 80496420, `DSPSendCommands2__FPUlUlPFUs_v`
+804962C0, `DSPAddPriorTask__FP13DSPTaskStruct` 80496520,
+`DSPReleaseHalt2__FUl` 80495EA0, `DSPSyncCallback__9JASDriverFv` 80495DA8,
+`DSPCallback__14JASAudioThreadFPv` 80494CC0. Replace `DSPSendCommands2`
+with a host function that feeds the words straight into the HLE (no
+mailbox at all) and invokes its completion callback as a deferred
+callback; replace `DspBoot`/`DspStartWork` to start the HLE.
+
 What this removes: the DSP worker thread (17 % of a core on the laptop),
 the mailbox spin (2.5 % of the simulation thread), MRAM transaction
 notifies (2 %), the DSP/ARAM faults, `poll_native_dsp`, and the AI DMA
@@ -325,6 +356,13 @@ Design:
    `DVD_STATE_END` in the command block. The DI register model, the
    `/dev/di` IPC path and the `ipc-reg-write-804D1F10` intercept are
    retired.
+Device paths the runtime handles today (`native_host.cpp`): `/dev/di`,
+`/dev/es`, `/dev/fs`, `/dev/stm/immediate`, `/dev/stm/eventhook`,
+`/dev/usb/oh1/57e/305` (the Bluetooth adapter). Confirm the full set with a
+boot trace of `IOS_Open` 804D27E8 before implementing; WiiConnect24
+(`threadProc__15NWC24SendThreadFPv` 8040893C) and `/dev/net/*` should be
+answered "not available" so their threads never start.
+
 2. NAND and ISFS: already largely native (`AsyncNandState`); replace the
    remaining IOS request plumbing (`IOS_Open/Ioctl/Ioctlv/Read/Write/Close`
    and `IPCInit`) with direct host calls per device path (`/dev/fs`,
