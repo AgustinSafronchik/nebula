@@ -516,6 +516,39 @@ margin): simulation thread 17.2 to 16.6 % (not in every pair), AI-DMA service
 lateness mean 96 to 230 us and one event later than a whole buffer; the event
 wake is less punctual than the armed timer, so the margin stays.
 
+## Native21 session 2026-10-11: cooperative scheduler (`GALAXY_COOP`)
+
+Guest threads run on fibers and interrupts are calls instead of emulated
+exceptions (`coop_scheduler.{h,cpp}`, the `coop_*` functions in
+`native_runtime.cpp`). Gameplay route A/B, same binaries, 4 rounds:
+simulation thread 15.6/16.1/15.7/16.4 to 14.3/14.2/13.7/17.3 % of a core
+(mean 15.95 to 14.9, lower in 3 of 4 pairs); render thread within the
+route's run-to-run spread (8 to 16 %). Home menu route (open and close):
+simulation thread 36.3 to 19.8 %, render 15.5 to 9.7 %, repeated frames
+15 to 10.
+
+| Item | Change | Measured |
+| --- | --- | --- |
+| Host SelectThread | SelectThread 0x804AB20C is host code over the SDK's own run queues in guest RAM (preemption test, SetRun, idle with IdleContext current, switch callback); the translator routes every call to it through the host (generation 18). Each guest thread has a fiber (256 KiB committed, 8 MiB reserved, float switching); a switch copies the per-thread registers and the runtime's per-chain scope depths (checkpoint gate, checkpoint callback identity). A new thread's fiber loads its OSContext as OSLoadContext would and runs into OSExitThread; fibers of exited threads are freed | flag transfers per 100 s gameplay run 230,390 to 4 (the four are OSInit's real-mode BAT helper, which still uses the flat loop) |
+| Interrupts as calls | The external dispatcher's selection (PI cause decode, OS and user masks, the guest's InterruptPrioTable at 0x805DC258) and DecrementerExceptionCallback's alarm pass (unlink, InsertAlarm re-arm, SetTimer through PPCMtdec) run natively; the handler runs on the current fiber below the interrupted r1 with the scheduler disabled and EE clear, then the interrupted registers are restored. The end-of-interrupt reschedule runs after the checkpoint callback returns, where no runtime scope is live | per run: time-base reads 8.56 M to 2.85 M, broker re-arms 336 k to 129 k, broker wakes 148 k to 39 k |
+| Idle | No runnable thread: the host runs the checkpoint body at the SDK idle-loop pc (sleep toward the next deadline, then service). The AI-DMA probe is tested by time there (the checkpoint-count probe never advances while no guest code runs); inside the AI margin the pass spins up to 20 us on the event latch, PE levels and the AI deadline | idle passes 5.3 M to 61 k per run; AI-DMA service lateness mean 240 to 103 us (exception path 83 us) |
+| Frame boundary | A delivery that readies a higher-priority thread ends a blocked thread's PE wait so that thread runs; the blocked thread re-enters the wait before it runs guest code again (the exception path resumed it only inside the wait) | |
+| Home Button sidecar | A tail call (b or bctr) whose callee returned continues at the link register instead of ending the call; a return above the call's entry frame leaves the call and the runtime resumes it from the flat chain. Both were masked by the exception path's flat transfers | Home menu route above; 400 outer returns per open |
+
+| Quiet interrupt re-enable | `GALAXY_QUIET_ARCHITECTURE_CHECKPOINTS` now defaults on: an `mtmsr` that sets EE at OSEnableInterrupts/OSRestoreInterrupts (0x804A8104/0x804A8128) returns without the checkpoint body when no event is latched, no device level is raised, every absolute deadline (VI, DEC, AI-DMA, HID) is in the future and the inline schedule is not due. A census before the change: 0x804A8128 alone was 2.56 M of the full checkpoint callbacks in 90 s (about 75 %) | cooperative path, 4 rounds: simulation thread 16.8/16.2/15.4/16.0 to 15.1/15.4/14.4/16.0 %; checkpoint bodies 3.48 M to 1.25 M per run; AI-DMA lateness unchanged (about 96 us mean) |
+| Defaults | `GALAXY_COOP` defaults on when the module reports host-routed SelectThread (`kModuleTransferFlagHostSelectThread`, generation 18); older modules keep the exception-transfer scheduler. `GALAXY_COOP=0` selects it explicitly | scenarios with defaults: gameplay route, Home menu open/close, fresh boot to file select (150 s), title idle (240 s): no failures, 59.88 to 59.94 new frames/s, repeats only at boot |
+
+Exact profile, gameplay route with the defaults (250 us sampling, 29,295
+running samples): guest code 66 %, runtime 22 %, other 12 % (the
+exception-path profile of Native17 had guest code at 55 to 60 %). Guest
+time is flat (no function above 1.1 %); the JGeometry TVec3 operators
+(`__apl`, `set`, `__ct`, `__mi`, `__as`) are about 4 % together and the
+string routines (`strstr`, `strcmp`, `isEqualString`, `FindPaneByName`)
+about 2.8 %.
+
+Not adopted: an idle spin without the time-based AI probe (5.6 M to 5.3 M
+idle passes: the AI deadline stayed due, so the spin returned at once).
+
 ## Known simulation-thread stalls (from the 9950X3D A/B telemetry)
 
 - (Resolved, F9 pointer) Keyboard/mouse pointer mode waited for the current
