@@ -249,6 +249,29 @@ simulation thread (about 3 percent); the DSP mailbox spin waits for the
 coprocessor worker (about 1 percent); the remaining pointer-based register
 faults.
 
+## Native11 session 2026-10-10 (overnight)
+
+Measurement for this session comes from outside the runtime where possible:
+`D:\NebulaWork\native\tools\thread_sampler.py` reads every thread's
+`GetThreadTimes`, cycle count and `GetThreadDescription` once per second, and
+`nrun.ps1` runs a package copy with it attached. PresentMon needs elevation on
+this machine and was not usable. Title screen, 9950X3D, Native10, 60 s:
+simulation thread 28.4 % of a core (peak 1 s window 47.6 %), render 13.5 %,
+DSP worker 5.8 %.
+
+| Item | Change | Evidence |
+| --- | --- | --- |
+| P0 crash dumps | The dump directory defaulted to the relative `generated\diagnostics`, which one `CreateDirectoryW` cannot create in an installed copy (the laptop crash of run 025441 failed with error 3). It is now resolved at startup: `GALAXY_CRASH_DUMP_DIR` (the launcher points it at the recording folder) or `%LOCALAPPDATA%\Nebula\crashdumps`, created component by component. The default dump keeps stacks, registers, referenced memory, module data, handles and the memory map; `GALAXY_CRASH_DUMP_FULL=1` writes full memory | `GALAXY_CRASH_TEST=1` (a worker thread writes to null 5 s after start): 100.7 MB dump written, `[crash]` lines carry the thread id |
+| P0 thread names | Every runtime thread calls `name_current_thread` (SetThreadDescription plus a `[thread] name= id=` line): simulation, render, window, DSP, deadline broker, async disc, THP decode, texture decode, PSO prewarm/compile/disk writer, HID input/output, audio, telemetry, profiler. The launcher's `threads.csv` gains a `name` column | names read back by the external sampler |
+
+Correction to plan P5: the runtime already calls `timeBeginPeriod(1)`
+(`ScopedTimerResolution`), opts the process and the simulation thread out of
+execution-speed and timer-resolution power throttling, raises the class to
+ABOVE_NORMAL with the simulation thread at HIGHEST, and registers the
+simulation thread with MMCSS Games, all at the top of `wmain` since the first
+public snapshot. The laptop's 20 to 105 ms idle-loop gaps happened with all of
+that active, so their cause is elsewhere.
+
 ## Known simulation-thread stalls (from the 9950X3D A/B telemetry)
 
 - (Resolved, F9 pointer) Keyboard/mouse pointer mode waited for the current
