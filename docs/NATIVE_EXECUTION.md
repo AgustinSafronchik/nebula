@@ -455,6 +455,27 @@ simulation-thread CPU):
   spinning: a guest loop waits for an interrupt with no polling point.
   Generation 18 needs the host idle loop / SelectThread and explicit
   spin-wait handling before branch checkpoints can go.
+- FPR/PS1 residency (`guest_resident_float`) under fast float: simulation
+  thread 20.7 % (3 runs) without, 21.1 % with; not enabled. The pass loads
+  and stores every used float register at entry and exit, which offsets the
+  removed per-operation synchronization.
+
+Where the simulation thread's guest time goes (gameplay route, 250 us
+sampling, 29,029 guest samples; attribution is by the last call target,
+so it is approximate inside callers): J3D 16 %, SDK paired-single matrix
+and vector library 7.6 % (PSMTXConcat 3.3 %, PSVECNormalize 0.8 %,
+PSMTXCopy 0.6 %), OS 9.4 % (SelectThread 6.6 %), JPA particles 4.7 %, GX
+2.5 %, libc 2.1 %, Bluetooth/WPAD/KPAD/SC 0.7 %, the rest spread over
+game code with no function above 1.8 %.
+
+Render thread on the AMD iGPU at 480p: 8.1 % of a core; FIFO parse and
+display-list replay, draw-state building and vertex decode lead; memcmp
+is 9 % of its running time, from display-list and packet-run cache
+validation (a full byte compare on every replay; skipping it would rely on
+guest-write tracking being complete). Process memory on the route: 586 MB
+working set / 809 MB commit with the discrete GPU, 906 / 778 MB with the
+iGPU, flat over 120 s. Pause menu and Home menu with the host mixer: no
+clipping or DC offset in the captured audio.
 
 ## Known simulation-thread stalls (from the 9950X3D A/B telemetry)
 
