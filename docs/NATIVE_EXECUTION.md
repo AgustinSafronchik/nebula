@@ -502,8 +502,15 @@ samples: SelectThread 6.1 %, `native_savegpr` 3.4 % + `native_restgpr`
 | Diagnostic gates | 68 single-flag env gates (`static const bool` locals, a thread-safe-static guard check per call) use a constant-initialized atomic cache; several sit on every runtime-dispatched guest call | exact profile: gate samples about 420 to 100 (about 1 % of the simulation thread); A/B within noise |
 | Idle-wait diagnostics | `[idle-loop-sleep]` adds skip reasons (transfer/off/mask/dispatch/vi-boundary/vi-due/short/levels/retest) | 90 s gameplay: 121,678 waits; skips 29,208 short (inside the 250 us AI-DMA margin), 1,031 device levels, 572 latch mask, 517 VI due |
 
+| Quantized and gather-pipe psq_st (Native20) | `fast::psq_store` handles u8/u16/s8/s16 store types and binary32 stores to the write-gather pipe lane by lane through `store<T>` (same quantization helpers) instead of the exact path's checked stores with per-element publication | `bench/psq_store_check.cpp`: 2,560,000 fast/exact cases (all types, scales -32..31, special values), 0 byte differences |
+| GX immediate XF loads (Native20) | GXLoadPosMtxImm (existing batched helper), GXLoadTexMtxImm and GXLoadLightObjImm emit each command as one or two gather-pipe writes; psq-copied words keep their store image (denormals flush), lwz/stw words stay raw; LightObj sets `__GXData->bpSentNot` | `bench/diff_gx.cpp`: 20,000 trials each, gather-pipe bytes and RAM identical. Exact profile: these routines plus the psq slow path 330 to 149 samples (about -0.9 % of module time); the slow path's callers were these three (88 %) |
+| FIFO chunk boundaries (Native20) | A top-level command split across a chunk boundary is detected from its length before parsing (fixed sizes, XF count, vertex count times a 160-byte bound, then the exact draw size) instead of a `FifoNeedMoreData` exception from inside the command; both the renderer and the PE classifier parse every chunk | render thread exception unwinding samples 333 to 6; renderer and snapshots unchanged |
+| Profiler | `[sim-profile-module-pair]` pairs each module sample with its first return address; `rva_profile.py --callers NAME` lists callers of a symbol | |
+
 Tried and not adopted: re-entering the slow checkpoint after every idle-loop
 batch (SelectThread samples unchanged; the spin was the guard window).
+`GALAXY_GX_VERTEX_DEPENDENCY_PAGE_FILTER=1`: render thread 11.8 to 13.1 %
+(3 rounds), no gain.
 `GALAXY_REALTIME_VI_AUDIO_DEADLINE_MARGIN_US=0` (sleep through the AI-DMA
 margin): simulation thread 17.2 to 16.6 % (not in every pair), AI-DMA service
 lateness mean 96 to 230 us and one event later than a whole buffer; the event
