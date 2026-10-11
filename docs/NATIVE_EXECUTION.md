@@ -48,7 +48,7 @@ routines 2 to 3x (PSMTXIdentity 32.7 to 12.2, PSMTXCopy 39.6 to 18.1,
 at 638 and 233 ns, bound by context memory traffic and the load/store slow
 paths (see below).
 
-Native ABI is 25; generation version is 13. Every module must be regenerated.
+Native ABI is 26; generation version is 17. Every module must be regenerated.
 
 Hand-written native substitutions stay disabled for functions that execute FP
 instructions: they use the exact out-of-line float helpers and measured 1.3 to
@@ -145,6 +145,110 @@ Findings from the user's detailed diagnostics recording and what changed:
   session says where the remaining time goes.
 - Still open: one 31.7 ms EFB texture copy; F20 fibers (31 unwinds/s).
 
+## Native9 session 2026-10-10 (laptop Native8 recording and desktop named profile)
+
+The laptop recording with Native8 (9 minutes, Core Ultra 185H) and a desktop
+session profiled with symbols decided this round. Native ABI is 26 and the
+generation version is 16; every module must be regenerated.
+
+What the recordings showed:
+
+- The 32 ms stalls (126 of the last 128 checkpoint gaps, p50 32.5 ms, one
+  every 1.3 s, 417 host-suspension recoveries) all ended at the return of the
+  IPC register write 0x804D1F10: a /dev/di read copying from the
+  memory-mapped game.pak on the simulation thread, page-ins included. They
+  were never the idle loop. Frame production ran at 43.7 new frames per
+  second with 24.5 percent duplicate presents, which is also the "pointer
+  polling" feel.
+- Per gameplay frame on the simulation thread: the render memory snapshot's
+  dependency scan p50 0.98 ms, p90 1.9 ms, max 14 ms, and the snapshot copy
+  p50 0.66 ms (3.2 MB), p90 1.3 ms (6.3 MB). Input polling p50 274 us, p90
+  913 us per 10 ms report: XInputGetState on the three empty controller slots.
+  The FIFO is 61 to 126 KB per frame, 2,000 to 4,000 gather-pipe bursts.
+- Desktop profile by symbol: GetThreadTimes on every time-base read was 3.2
+  percent of all simulation-thread samples, SetEvent per publication 1.1
+  percent, QueryPerformanceCounter 0.4 percent, condition-variable wakes 0.4
+  percent; C++ exception unwinds (GuestTransfer) about 0.6 percent; the FIFO
+  dependency scan and memory snapshot on the simulation thread; the context
+  poison diagnostic on every exception save.
+- Generated code (functions_0300 compiled to assembly): every guest load or
+  store spent about eight instructions on the alias-table range test plus a
+  spilled base-pointer reload, and every call return stored and reloaded all
+  resident registers around the checkpoint.
+
+What changed:
+
+| Item | Change | Where |
+| --- | --- | --- |
+| Disc reads | /dev/di reads copy on a worker (`AsyncDiscState`), the IPC reply posts from the simulation thread when the bytes have landed, and `PrefetchVirtualMemory` reads the next 4 MB ahead (`GALAXY_DISC_PREFETCH_BYTES`). `GALAXY_ASYNC_DISC_READS=0` restores the synchronous copy. Boot smoke: 1,222 reads, 29.9 MB, maximum copy 229 us off the critical thread | `native_host.cpp` |
+| F3b fastmem | Modules compiled with `GALAXY_FASTMEM` (generation 16, clang) load and store through the flat view with no range test: fixed instruction forms (`movbe`/`movzx` loads, `movbe`/`mov` stores, `-mmovbe`) emitted by inline assembly in `native_api.h`. Accesses outside the mapped RAM aliases fault into a vectored handler that decodes those forms, completes the access through `GuestAddressSpace::fault_access` (devices first, then any region such as the locked cache) and resumes. The write-gather pipe keeps one masked compare in `store` and `psq_store` because every GX vertex passes through it. `[fastmem]` and `[fastmem-hot-page]` lines at exit report the fault counts by guest page | `native_api.h`, `native_fast_paths.h`, `flat_guest_memory.cpp` |
+| F21 (batch) | The live gather buffer is 4,096 bytes (ABI 26, `kWgpipeGatherFastBytes`); generated stores append in place and the host runs once per buffer. `drain_wgpipe_gather_bursts` lands every complete 32-byte burst in the CPU FIFO as contiguous runs (one publication per run) before any CP/PE/VI/PI register access, the frame handoff (`take_gx_fifo`) and the frame-boundary tail flush, so nothing can observe a stale FIFO | `native_host.cpp` |
+| F5 (call return) | Resident bodies test `call_return_checkpoint_due` inline and synchronize their registers only inside the cold `call_return_checkpoint_counted` branch (334,128 sites); the fast path performs no context traffic | `residency.rs`, `native_api.h` |
+| THP | `THPSimplePlayerWrapper::videoDecode` hands the JPEG payload to one worker and returns; the planes land when the simulation thread joins the job before every `gx::render_frame` (`join_native_thp_video_decode`) or before the next decode. `GALAXY_NATIVE_THP_ASYNC_DECODE=0` restores the inline decode; `[thp-hle-video-join]` reports decode and wait times | `native_runtime.cpp` |
+| Time base | The thread CPU-time sample (GetThreadTimes) is reused while the sampled QPC is less than 1 ms past it; this can only over-report elapsed CPU time, so it never manufactures a suspension candidate | `runtime_time_base_ticks` |
+| Idle wake | The idle wait announces itself (`set_idle_waiting`) and re-tests the mask; publishers signal the wake event only while a waiter is announced, so a publication from a thread nobody waits on costs no kernel transition | `runtime_timeline.cpp`, `idle_loop_wait_for_next_deadline` |
+| Diagnostics off the hot path | The context poison check on every exception save is opt-in (`GALAXY_TRACE_CONTEXT_POISON`). Disconnected XInput slots are retried every 2 s instead of every report | `save_exception_context`, `poll_native_hid_controller` |
+| Profiler | Samples are running or blocked (RIP inside a wait system call), stack-walked through a private copy of every image's unwind table (RtlLookupFunctionEntry deadlocked a boot while the target was suspended), and attributed to the guest caller, the runtime caller of foreign-module time (`[sim-profile-other-caller]`) and the wait site (`[sim-profile-blocked-site]`). `NebulaRuntime.pdb` is built (`/Zi`, `/DEBUG /OPT:REF /OPT:ICF`) and shipped beside the executable so names resolve in the recording itself | `native_runtime.cpp`, `CMakeLists.txt` |
+| Live settings | The F1 overlay's video tab changes the internal resolution live (the render thread re-creates the EFB targets, conversion views and scaled copy destinations at the next frame boundary; `EfbCopyManager::set_efb_scale` re-sizes XFB textures on acquisition), cycles output size presets (854x480 to 7680x4320, applied by the window thread) and toggles borderless fullscreen | `renderer_d3d12.cpp`, `efb_copy.cpp`, `gx_backend.cpp` |
+
+Second pass on the same desktop profile after the first build (120 s title
+screen, 21,600 running samples): MMIO polling through the fault handler was
+4.2 million faults, 91 percent of them the DSP driver spinning on the to-DSP
+mailbox until the coprocessor takes a mail; the to-DSP mailbox read now waits
+up to 200 us for the worker before answering (faults 3.8 to 2.6 million).
+The deadline broker is woken only for a deadline earlier than the one its
+worker sleeps toward (SetEvent samples halved). Environment flag reads are
+cached by literal pointer once boot configuration is done (strchr samples
+halved). The generated module measured 2x slower per call with the inline
+assembly memory forms (60.5 against 31.4 ns) because they hid every guest
+access from alias analysis; the 16/32/64-bit forms are the movbe intrinsics
+again and the fault decoder accepts the resulting mov/movbe/movzx/immediate
+forms.
+
+`GALAXY_RENDER_LIVE_MEMORY=1` with `GALAXY_RENDER_MEMORY_SNAPSHOT=0` lets the
+render thread read guest RAM directly while the simulation runs ahead, the
+hardware's own GP model and Dolphin's dual-core model; it removes the
+per-frame dependency scan and the 3 to 6 MB snapshot copy from the simulation
+thread (10 to 19 percent of a laptop frame). The independent VI policy
+accepts it as the memory-ownership proof. It relies on the game's GXDrawDone
+discipline and triple-buffered frame data exactly as the hardware does.
+
+Still open after this round, in order: GuestTransfer unwinding (the C++
+throw per interrupt return was about 10 percent of running samples on the
+title screen: plan is flag-based unwinding through the call-return
+checkpoints instead of fibers), the periodic checkpoint body (two clock reads
+and a decrementer sync per 2,048 counted checkpoints), latch lock contention
+between the broker and the simulation thread, and the remaining register
+faults (IPC, PI, VI pages at 1 to 2 thousand per second each).
+
+## Native10 session 2026-10-10 (evening)
+
+The laptop recording's thread table settled where the time goes: the
+simulation thread used 80 percent of one core over nine minutes and the
+render thread 20 percent, so the program stays on the simulation thread.
+A `[host-census]` line at exit now counts time-base reads (guest and
+runtime), checkpoint bodies and CPU-time syscalls; the title screen reads
+the time base 250 thousand times per second, 225 thousand of them from the
+runtime's own checkpoint body, which runs 33 thousand times per second.
+
+| Item | Change | Where |
+| --- | --- | --- |
+| Static device lowering | Integer loads and stores whose effective address is a translation-time constant outside the flat RAM aliases (DSP mailbox, IPC, PI, VI, CP; `lis`/`addi`/`ori` chains tracked like the WGPIPE store runs) lower to the checked helpers and never take a host fault. 2,174 loads and 569 stores. Faults per two-minute title screen 3.2 million to 327 thousand; the DSP mailbox poll (2.5 million) is gone. What remains is pointer-based: IPC control 0xCD000004 at 1,250 per second, VI, CP and PE registers, EFB peeks | translator `discover_static_device_access_pcs` |
+| Fastmem forms | Plain loads and stores (`GALAXY_FASTMEM_VOLATILE=1` restores the volatile forms; they measured no faster, the apparent 2x in the module benchmark was a stale harness). A census of nine compiled shards found only mov/movbe/movzx/movsx/immediate forms with two-register addressing plus rare `vmovsd`, `vmovd`, `vpinsrd`; the fault decoder covers those, `movsxd`, VEX and legacy SSE moves, pinsr/pextr, and completes a device access wider than the device accepts as ascending 4-byte pieces | `native_api.h`, `flat_guest_memory.cpp` |
+| F20-lite | Flag-based interrupt return (generation 17). An RFI that resumes elsewhere sets `kPendingEventTransferBit` in the pending-event mask and returns; every checkpoint fast path then escalates, the cold blocks (`GALAXY_RETURN_IF_TRANSFER_PENDING`, emitted by the residency pass for resident bodies and by `apply_transfer_returns` for the rest, plus after `mtmsr` and `sc`) return without touching the context, every runtime dispatcher and the checkpoint body return early while the transfer is pending, and `run_guest_entry` consumes it where its `GuestTransfer` catch did. The C++ throw and two-phase unwind per interrupt return were about ten percent of the simulation thread's running samples on the title screen. A module without `galaxy_module_transfer_flags`, or `GALAXY_FLAG_TRANSFER=0`, keeps the exception path; `FpuRetryTransfer`, benchmark and quit stay exceptions. Opt-in (GALAXY_FLAG_TRANSFER=1) until validated; state and remaining steps in docs/PERFORMANCE_PLAN_NATIVE11.md P2. | `return_from_interrupt`, `take_pending_flat_transfer`, `native_api.h`, `residency.rs` |
+| Live render memory | Shipped default (`GALAXY_RENDER_LIVE_MEMORY=1`, snapshot off): the draw-done and independent-VI policies accept `render_live_memory_reads` as memory ownership, the producer queue gate is the queue depth. Title-screen running share of the simulation thread 25.3 to 23.0 percent with the same module | `render_config.cpp`, `fifo_submission.h`, `gx_backend.cpp` |
+| TSC clock | `invariant_tsc_counter_source`: rdtsc divided by 8, calibrated against QPC for 40 ms, 0.64 fixed-point tick scaling; one rdtsc per timeline read instead of a QueryPerformanceCounter call. `GALAXY_TSC_CLOCK=0` keeps QPC. The CPU-time cache threshold follows the timeline's counter frequency | `runtime_timeline.cpp`, `runtime_time_base_ticks` |
+| Producer pools | Dirty-range vectors recycled with the FIFO chunks; drain scratch is a member | `gx_backend.cpp` |
+| Config | VI poll checkpoints 8192, host pointer poll cache 4 ms | `installer/runtime-env.json` |
+
+Still open after this round: the checkpoint body cadence (33 thousand per
+second at the title screen because several pending-but-undeliverable
+conditions schedule the next body at the very next checkpoint) and its
+seven time-base reads; PE event classification still parses the FIFO on the
+simulation thread (about 3 percent); the DSP mailbox spin waits for the
+coprocessor worker (about 1 percent); the remaining pointer-based register
+faults.
+
 ## Known simulation-thread stalls (from the 9950X3D A/B telemetry)
 
 - (Resolved, F9 pointer) Keyboard/mouse pointer mode waited for the current
@@ -160,21 +264,20 @@ Findings from the user's detailed diagnostics recording and what changed:
 | --- | --- |
 | F5 (float) | FPR/PS1 residency is implemented (`guest_resident_float`, `_r` helper overloads on `fpr[32]`/`ps1[32]` locals) and off: under the exact model it measured 86.8 (store-all) and 87.9 ns (written-only) against 83.2 without it, because the exact fallback calls force spills. To be re-measured on top of fast float, where the float helpers make no calls |
 | F6 (checkpoints) | Branch and call-return checkpoints remain: counter, watermark and event-mask loads through the services table at every backward branch and call return |
-| F3b | Loads and stores still carry the alias-table range check with a cold checked-path call. Because `context` is captured, LLVM reloads context fields after every such merge; this, not the check itself, is what keeps guest registers out of host registers. Unconditional flat access with a fault handler for MMIO removes the slow paths |
 | F8 | DSP module codegen at the same standard |
 | F10 | PE tokens at FIFO consumption instead of GPU fence |
 | F12, F14 | Compact per-layout vertex stride; non-blocking pipeline misses (needs a real uber pipeline). The remaining texture spikes are resource creation, not decode; placed heaps or recycled resources are the fix |
 | F16 | Working-set investigation (2.8 to 5.4 GB observed) |
 | F17, F18 | Present phase lock to vblank; compile-time removal of remaining runtime trace gates |
-| F20 | Guest threads as fibers instead of exception unwinding |
+| F20 | Guest threads as fibers instead of exception unwinding (GuestTransfer unwinds measured about 0.6 percent of simulation-thread samples on the desktop) |
 | F23 | Native SIMD Yaz0 |
 
 ## Verification
 
-`cargo test --workspace` for the translator (424 tests; the temp-directory
+`cargo test --workspace` for the translator (426 tests; the temp-directory
 tests need a writable `%TEMP%`); the runtime test targets (60, including
 `galaxy_native_fast_float_tests` built with `GALAXY_FAST_FLOAT=1`) compile
-against ABI 25; a smoke run of the intro route on the build host boots,
+against ABI 26 (the fastmem forms are clang-only and inert under MSVC); a smoke run of the intro route on the build host boots,
 publishes the direct dispatch table, and answers depth peeks from the field.
 Differential register tracing against Dolphin remains the gate for any change
 to the admission rules above.
