@@ -26,12 +26,13 @@ Work order, biggest gain first:
 | Order | Item | Where | Expected gain |
 | --- | --- | --- | --- |
 | 1 | Crash dumps, thread names | Plan P0 | debuggability |
+| 1b | PE completion at FIFO consumption, not GPU completion | Plan P1.5 | removes the CPU/GPU serialization behind high-resolution lag |
 | 2 | Timer resolution and power-throttling opt-out | Plan P5, SDK plan 2.5 | removes the 20 to 105 ms laptop stutters |
 | 3 | Guest contexts as fibers | Step 1a guide | 10 to 14 % of the simulation thread |
 | 4 | Polled interrupt delivery, alarms, VI clock | SDK plan 1b, 2 | broker, decrementer and VI emulation gone |
 | 5 | Generation 18 without checkpoints | SDK plan 1c, 8 | checkpoint bodies (33k/s) and generated-code tests gone |
 | 6 | Host scheduler and sync primitives | SDK plan 1d | translated scheduler gone |
-| 7 | Zelda ucode HLE, AI clock, ARAM as memory | SDK plan 4, Plan P3 | DSP worker thread and mailbox spin gone |
+| 7 | Native JAudio mixer at the driver interface, AI clock, ARAM as memory | SDK plan 4, Plan P3 | DSP worker thread and mailbox spin gone |
 | 8 | DVD, IOS, NAND, SC as host calls | SDK plan 5 | DI/IPC emulation and pak working set gone |
 | 9 | WPAD/KPAD as host calls | SDK plan 6 | Bluetooth/USB stack and keyboard polling gone |
 | 10 | GX stage A then B | SDK plan 3 | PE emulation, FIFO pre-classification, then the FIFO parse |

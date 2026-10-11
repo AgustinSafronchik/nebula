@@ -36,12 +36,9 @@ a compatibility fallback that should see zero traffic.
   before, instead of, or after a translated function), and the direct
   dispatch table (`build_direct_dispatch_table`), which withholds every
   intercepted address so calls reach the host.
-- Audio: RMGE01 does not use AX. It uses JAudio (JAS) with the Zelda/JAudio
-  DSP ucode (`DSPSendCommands2__FPUlUlPFUs_v` at 804962C0,
-  `DSPCallback__14JASAudioThreadFPv` at 80494CC0, `__DSPHandler` at
-  804965A0). The host replacement is a Zelda-ucode HLE, which Dolphin
-  implements for this exact game (`Source/Core/Core/HW/DSPHLE/UCodes/Zelda.cpp`,
-  SMG variants), not an AX mixer.
+- Audio: RMGE01 does not use AX. It uses JAudio (JAS); the replacement is a
+  host mixer at the JAudio driver interface (section 4), with no DSP and
+  no microcode of any kind.
 - Threads in RMGE01: the main thread, the JAudio thread (`JASAudioThread`),
   the DVD/file loader threads (`FileLoaderThread`), the THP/movie threads,
   the WPAD/KPAD driver thread (`WPADi`), the NAND/NWC24 helper threads, and
@@ -260,77 +257,68 @@ the registers it writes (the translated bodies are the specification).
 The `GXPeek*` family and `GXReadBoundingBox` already have asynchronous
 host implementations; keep them.
 
-## 4. Audio: JAudio DSP ucode as host code, AI as a host clock
+## 4. Audio: native JAudio mixer, no DSP, no ucode
 
-Replace: `DSPInit` 804CB310, `DSPSendMailToDSP` 804CB2C0,
-`DSPCheckMailToDSP` 804CB28C, `DSPCheckMailFromDSP` 804CB29C,
-`DSPReadMailFromDSP` 804CB2AC, `DSPAssertInt` 804CB2D4, `__DSP_exec_task`
-804CB420, `__DSP_boot_task` 804CB5C4, `__DSP_remove_task` 804CB750,
-`__DSPHandler` 804965A0 (never installed), `AIInit` 804C7FC0, `AIInitDMA`
-804C7E7C, `AIStartDMA` 804C7EF8, `AIStopDMA` 804C7F0C, `AIGetDMAStartAddr`
-804C7F20, `AIGetDMALength` 804C7F38, `AISetDSPSampleRate` 804C7F48,
-`AIRegisterDMACallback` 804C7E38, `__AIDHandler` 804C8140 (never
-installed), `__AICallbackStackSwitch` 804C81E8, `ARInit` 804A0624,
-`ARAlloc` 804A05D4, `ARStartDMA` 804A0508, `ARQInit` 804A08BC,
-`ARQPostRequest` (name variant in the table), `__ARHandler` (never
-installed).
+RMGE01's audio is JAudio (JAS), the game's own middleware. JAudio keeps the
+state of every playing voice in `JASDsp::TChannel` blocks in guest RAM,
+written by the game's own code (`JASChannel::initialUpdateDSPChannel`
+80492FAC, `JASChannel::updateDSPChannel` 804932A4,
+`JASChannel::updateMixer` 80493710, `JASChannel::updateAutoMixer` 804935F4,
+`JASChannel::updateEffectorParam` 80492D1C, `JASAramStream::updateChannel`
+8048EBF8), and hands the whole set to the DSP once per audio frame
+(`JASDriver::updateDSP` 804944D0), which mixes them into a buffer the game
+then reads (`JASDriver::readDspBuffer` 804945CC) and finishes
+(`JASDriver::finishDSPFrame` 804946E8). The DSP and its microcode are an
+implementation detail below that interface.
 
-Design:
+The native replacement mixes those voices on the host directly:
 
-1. ARAM is a host buffer (16 MB); `ARStartDMA`/`ARQPostRequest` are
-   `memcpy` plus an immediate completion callback (deferred context).
-   Today's `DspAramMirrorBoundary` staging disappears.
-2. The DSP: a host implementation of the JAudio/Zelda ucode's command
-   protocol (Dolphin `ZeldaUCode`, the "SMG" variant: command list in
-   MRAM, per-voice PB processing, 5 ms frames of 128 samples at 32 kHz,
-   output to the AI DMA buffer the game provided). Mail handshake is
-   synchronous: `DSPSendMailToDSP` is consumed immediately (busy bit
-   clears), `DSPCheckMailFromDSP` returns the queued replies the HLE posts
-   when it finishes a frame, and the DSP interrupt handler the game
-   registered through `__OSSetInterruptHandler` for the DSP source is
-   called as a deferred callback when a reply is queued. The compiled DSP
-   module (`RMGE01_dsp.dll`) is kept behind `GALAXY_DSP_NATIVE=1` for A/B
-   and for the audio-correctness differential test, then retired.
-3. AI DMA: a host clock. `AIStartDMA` arms a block of `length` bytes;
-   `Audio_Tick` (called from the audio output thread's buffer callback, at
-   the block cadence of 32 kHz × 4 bytes) pushes the block to WASAPI and
-   runs the AI DMA callback (`__AIDHandler`'s registered callback, i.e.
-   JAudio's frame function) as a deferred guest callback on the
-   simulation thread at the next polling point, exactly as WiiCompiled's
-   `Audio_HLE_Tick` does. The audio thread never runs guest code.
-4. Mixing happens in the HLE on the audio thread; the simulation thread's
-   only audio work is the game's own JAudio frame (voice allocation,
-   command list construction), which is game code.
+1. Replace `JASDriver::updateDSP`, `readDspBuffer` and `finishDSPFrame`,
+   the DSP boot and command functions (`DspBoot` 804961E0, `DspInitWork`
+   804963E0, `DspStartWork` 80496420, `DSPSendCommands2` 804962C0,
+   `DSPAddPriorTask` 80496520, `DSPReleaseHalt2` 80495EA0, the `DSP*` SDK
+   functions 804CB28C to 804CB750) and the AI layer (`AIInit` 804C7FC0,
+   `AIInitDMA` 804C7E7C, `AIStartDMA` 804C7EF8, `AIStopDMA` 804C7F0C,
+   `AIRegisterDMACallback` 804C7E38, `AISetDSPSampleRate` 804C7F48,
+   `JASDriver::initAI` 804941F8, `startDMA`/`stopDMA`) with host functions.
+2. The host mixer reads each active `TChannel` block in guest RAM and
+   produces the samples the hardware would: sample source (PCM8, PCM16,
+   ADPCM in guest RAM or the ARAM buffer), pitch (resampling ratio),
+   volume and pan per mix bus, envelope, loop points, filter; then the
+   mix buses (main L/R, the effect sends) and the output volume. The
+   `TChannel` layout and field meanings come from the game's own code that
+   writes them: the Petari decompilation of RMGE01 (`include/JSystem/JAudio2/JASDSPInterface.hpp`
+   and `src/JSystem/JAudio2/JASDSPInterface.cpp` in
+   github.com/SMGCommunity/Petari, plus the shared JSystem headers in the
+   other JSystem decompilations) documents every field and every value the
+   game writes. That is the specification: what the game asks for, not how
+   a DSP program implements it.
+3. ADPCM decoding is the standard GameCube/Wii DSP-ADPCM format (4-bit
+   nibbles, 8 coefficient pairs per sample header, predictor/scale byte
+   per 8-byte frame); the coefficients are in each sample's header the
+   game loads. Resampling: 4-tap polyphase or cubic at host rate; exact
+   match to the console is not required.
+4. Timing: the audio output thread (WASAPI, event-driven) owns the clock.
+   Each 5 ms frame it mixes the voices whose `TChannel` state the game
+   published at the last `updateDSP`, writes into a lock-free ring, and
+   posts the AI DMA completion as a deferred guest callback, so the game's
+   `JASAudioThread::DMACallback` 80494C70 and `DSPCallback` 80494CC0 run
+   on the simulation thread at its next polling point (the
+   `JASAudioThread::run` 80494B2C loop is then just a guest thread waiting
+   on its message queue, scheduled cooperatively). The audio thread never
+   runs guest code.
+5. ARAM: a host buffer; `ARStartDMA` 804A0508 and the ARQ queue are
+   `memcpy` plus immediate completion.
+6. Validation: record 60 s of output from the current native-DSP path and
+   from the host mixer at the same input replay; compare the spectrum and
+   RMS per 5 ms frame (tolerance, not bit-exactness), and listen to the
+   title theme, a stage, and a cutscene.
 
-Ucode facts (Dolphin `Source/Core/Core/HW/DSPHLE/UCodes/Zelda.cpp`,
-GPL-2.0-or-later, read 2026-10-11): Super Mario Galaxy, SMG2 and Donkey
-Kong Jungle Beat Wii share Zelda ucode CRC `0xD643001F` with flags
-`NO_ARAM | MAKE_DOLBY_LOUDER | COMBINED_CMD_0D`. It uses the standard (not
-light) protocol: init pushes `DSP_INIT` then `0xF3551111`; a non-control
-mail's low 16 bits give the count of command words that follow; command
-`0x01` sets voices per frame, the VPB base, resampling coefficients, const
-patterns, sine table, AFC coefficients and reverb PB base; command `0x02`
-starts rendering `(cmd >> 16) & 0xFF` frames with an output volume and
-left/right output buffer addresses (plus two discarded words under
-`COMBINED_CMD_0D`); command `0x0E` sets the ARAM base (sound data comes by
-MRAM DMA because of `NO_ARAM`); sync mails carry 16-voice skip masks
-(`m_sync_max_voice_id = (((mail >> 16) & 0xF) + 1) << 4`); each rendered
-frame acks `0xF3550000 | (0xFF00 | frame)` and the batch ends with
-`DSP_FRAME_END`. Mixing buffers are 0x50 samples. Port `ZeldaUCode`,
-`ZeldaAudioRenderer` and the AFC/PCM decoders for this flag set only; the
-game-side glue is `DspBoot__FPFPv_v` 804961E0, `DspInitWork__Fv` 804963E0,
-`DspStartWork__FUlPFUs_v` 80496420, `DSPSendCommands2__FPUlUlPFUs_v`
-804962C0, `DSPAddPriorTask__FP13DSPTaskStruct` 80496520,
-`DSPReleaseHalt2__FUl` 80495EA0, `DSPSyncCallback__9JASDriverFv` 80495DA8,
-`DSPCallback__14JASAudioThreadFPv` 80494CC0. Replace `DSPSendCommands2`
-with a host function that feeds the words straight into the HLE (no
-mailbox at all) and invokes its completion callback as a deferred
-callback; replace `DspBoot`/`DspStartWork` to start the HLE.
-
-What this removes: the DSP worker thread (17 % of a core on the laptop),
-the mailbox spin (2.5 % of the simulation thread), MRAM transaction
-notifies (2 %), the DSP/ARAM faults, `poll_native_dsp`, and the AI DMA
-deadline emulation.
+What this removes: the DSP worker thread (17 percent of a core on the
+laptop), the mailbox spin (2.5 percent of the simulation thread), MRAM
+transaction notifies (2 percent), the DSP and ARAM register faults,
+`poll_native_dsp`, the AI DMA deadline emulation, and the compiled DSP
+module.
 
 ## 5. Storage: DVD, NAND, IOS
 

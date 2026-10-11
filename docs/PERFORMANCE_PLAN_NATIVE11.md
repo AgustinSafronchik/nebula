@@ -290,38 +290,18 @@ the laptop (the unwinder share), measured by `[transfer] exception-unwinds`
 going to zero and the `return_from_interrupt`/`dispatch_decrementer`
 other-caller rows disappearing.
 
-### P3. Audio HLE instead of the DSP coprocessor (JAudio/Zelda ucode, not AX)
-
-Correction from the symbol table: RMGE01 uses JAudio with the Zelda-family
-DSP ucode (`DSPSendCommands2__FPUlUlPFUs_v` 804962C0, `DSPCallback__14JASAudioThreadFPv`
-80494CC0), not AX. The host replacement is Dolphin's `ZeldaUCode` HLE
-(SMG variants), as laid out in `docs/SDK_REPLACEMENT_PLAN.md` section 4.
+### P3. Native JAudio mixer instead of the DSP coprocessor
 
 Evidence: the DSP worker is the second-busiest thread on the laptop (17 %
-of a core, thread id 33760/20916 in the recordings); the simulation thread
-spends 2.5 % spinning in `read_device+0x8a0` waiting for the worker to
-take a mail, 2 % notifying MRAM transactions, and takes the remaining
-0xCD000000/0xCC005000 faults for mailbox and ARAM traffic; `[fastmem]`
-mmio counts are dominated by it; the previous session's DSP sync pacing
-and mailbox waits are all workarounds for a coprocessor model.
-WiiCompiled runs `hle/audio/ax_mix.cpp` (a host AX mixer polled at 4 kHz)
-and Dolphin's default is AX HLE for the same reason.
+of a core); the simulation thread spends 2.5 % spinning in
+`read_device+0x8a0` waiting for the worker to take a mail and 2 % notifying
+MRAM transactions, and takes the remaining mailbox and ARAM faults.
 
-Steps: implement the AX ucode protocol in host code (Dolphin's
-`Source/Core/Core/HW/DSPHLE/UCodes/AX.cpp` and `AXWii.cpp` are the
-reference, GPLv2; WiiCompiled's `ax_mix.cpp` is GPLv3 and already shaped
-for a recompilation runtime): parse the AX command list the game writes
-(`AXCommand` list from the mailbox `0xCDD1`/`0xBABE` protocol), mix voices
-(PB chains in MRAM/ARAM) into the output buffers the game expects, run it
-from the audio output thread at the AI DMA cadence, and acknowledge mails
-immediately (the busy bit clears on write). Keep the compiled DSP module
-(`RMGE01_dsp.dll`) behind `GALAXY_DSP_NATIVE=1` for A/B. The JAudio
-command framing is documented by the `[dsp-cmdsnoop]` trace already in
-`dsp_native_forward_mail`.
-
-Expected gain: 4 to 6 percent of the simulation thread, a whole worker
-thread (important on a 4-core i7), and the end of the DSP-related stutter
-sources (MRAM transaction waits, `poll_native_dsp` blocked samples).
+Design and steps: `SDK_REPLACEMENT_PLAN.md` section 4. The game's JAudio
+code already describes every voice in `JASDsp::TChannel` blocks; a host
+mixer reads those blocks at the JAudio driver interface
+(`JASDriver::updateDSP` 804944D0, `readDspBuffer` 804945CC,
+`finishDSPFrame` 804946E8) and no DSP, mailbox or microcode exists at all.
 
 ### P4. Checkpoint substrate (until P1c removes it)
 
@@ -405,10 +385,70 @@ Steps:
 3. Measure with `[thp-hle-video-join]`: wait-mean-us must be near zero.
 4. Confirmed: `runtime/src/native_thp_video.cpp` contains no SSE intrinsics at all (scalar IDCT, scalar color conversion); the keyboard poll (`collect_native_key_levels` over `kFunctionalVirtualKeys`, `native_host.cpp` line 8046) calls `GetAsyncKeyState` once per key per poll, which is the `NtUserGetAsyncKeyState` row in the laptop profile.
 
-### P7. 1080p internal resolution on the iGPU
+### P1.5. CPU/GPU serialization: the real cause of high-resolution lag (do this right after P0)
 
-Evidence: at EFB scale 3 the simulation thread share is unchanged (61 %),
-so the slowdown the user feels is the GPU. Both laptop runs still present
+Correction to an earlier conclusion in this document. The user observed
+1440p internal on the 185H lagging badly with the Arc iGPU at about 30
+percent utilization and the CPU at 9 percent. Neither side is saturated,
+so the limit is not GPU throughput: it is latency, the pipeline waiting on
+itself. The code shows exactly where.
+
+The chain for every frame today:
+1. The simulation thread finishes frame N's FIFO and the game calls
+   `GXDrawDone` / `GXSetDrawSync` (PE finish and token).
+2. Nebula answers PE finish and PE tokens from the real GPU fence
+   (`GALAXY_PE_EVENTS_GPU_FENCE=1`; `FramePeCompletionToken`,
+   `wait_for_frame_pe_completion_for` in `gx_backend.cpp:6049`), so the
+   game's finish flag (`kGxFinishedFlag` 0x806A2EF8, set only by the
+   translated PE finish handler) is set only after the GPU has completely
+   executed frame N.
+3. The persistent VI boundary (`advance_pending_vi_boundary`,
+   `native_runtime.cpp:18276`) and the draw-done submission
+   (`poll_draw_done_submissions`, 16278) and the GX sync path
+   (`render_pending_gx_fifo_for_sync`, 16432, via
+   `wait_for_frame_pe_completion_cooperatively`) all poll that token, and
+   RMGE01's triple-buffer main loop will not start drawing frame N+1 into
+   the XFB slot until the finish flag says frame N is done
+   (`independent_vi_completed_drawn_valid` documents this).
+4. Meanwhile the render thread waits for a frame slot
+   (`RendererD3D12::begin_frame` waits on `fence_values_[frame_slot_]`,
+   `renderer_d3d12.cpp:4256`, with `kFramesInFlight = 2`) and for the swap
+   chain (`wait_for_frame_latency_if_needed`, latency 1), with a render
+   queue depth of 2.
+
+So per frame the time is simulation + render-thread recording + GPU
+execution + present wait, in series. At 480p the sum fits in 16.7 ms; at
+1440p the GPU part grows and the sum overflows, while each component is
+idle most of the frame, which is exactly 30 percent GPU and 9 percent CPU.
+
+Fix (native, no device emulation):
+1. Complete PE finish and PE tokens when the render thread has consumed
+   the FIFO (the CPU side of the frame is recorded and every guest-memory
+   read for it has happened), not when the GPU finishes. With live render
+   memory this is the moment `mark_frame_cpu_reads_done` runs. On the
+   hardware the PE interrupt means "the GP has processed the commands";
+   nothing in RMGE01 reads GPU-written results back on the CPU except the
+   EFB peeks, which are already asynchronous fields. This is the F10 item
+   from the original list. Expose it as `GALAXY_PE_EVENTS_AT_CONSUMPTION=1`
+   (default on) and keep the fence mode for A/B.
+2. With the SDK replacement (`SDK_REPLACEMENT_PLAN.md` section 3 stage A),
+   `GXDrawDone` becomes a host function that returns when the render
+   thread has taken the frame, and the draw-done callback runs then.
+3. Frames in flight 2 to 3 and render queue depth 2 to 3 once item 1
+   lands (more buffering only helps when the CPU no longer waits for GPU
+   completion); keep swap-chain latency 1 for input latency, with the
+   present scheduled on the VI clock.
+4. Measure: per-frame timeline in the Detailed recording must show the
+   simulation thread starting frame N+1 while the GPU executes frame N.
+   Expected: high internal resolutions run at 60 until the GPU is actually
+   saturated (near 100 percent utilization), instead of failing at 30.
+
+### P7. High internal resolution GPU cost (secondary to P1.5)
+
+Evidence: at EFB scale 3 the simulation thread share is unchanged (61 %).
+This is not a GPU-throughput limit (see P1.5: the GPU sits at 30 percent
+while the frame chain serializes); the items below reduce GPU work per
+frame once the serialization is gone. Both laptop runs still present
 60.0 fps on average with `frame-ms(max)` 18.4 to 19.0 ms, so what the user
 sees at 1080p are per-frame spikes (occasional dropped presents: 11,700
 requested, 11,693 presented), not a lower average. `[efb-copy-work]` for the
@@ -484,7 +524,7 @@ Steps:
 | `ZwAlertThreadByThreadId` 1,740 | WakeByAddress from latch publications and the DSP MRAM notify | After P3 most disappear; otherwise coalesce notifies per checkpoint |
 | `drain_guest_memory_writes` 780 | dirty-page bitmap scan per frame | Track only the display-list and vertex-array ranges the parser depends on (the dependency cache knows them) instead of 320 MiB of pages |
 | `lookup_function` 425 | hash lookup per flat hop | Use the direct dispatch table for interior entries; moot after P1 |
-| Remaining faults: IPC 0xCD000004 (2,000 per s), VI 0xCC002000, CP 0xCC000000, PE 0xCC001000 | `[fastmem-hot-address]` | These are pointer-based accesses (`__IPCRegs`-style globals). Add a translator rule: an address loaded from a known global whose value is a constant in the DOL's data section (the translator can read `.sdata`/`.data` initial values) is static; or in the runtime patch the hot sites by backpatching the faulting instruction to a `call` thunk when the same (pc, page) faults more than N times, the Dolphin way |
+| Remaining faults: IPC 0xCD000004 (2,000 per s), VI 0xCC002000, CP 0xCC000000, PE 0xCC001000 | `[fastmem-hot-address]` | These are pointer-based accesses (`__IPCRegs`-style globals). Add a translator rule: an address loaded from a known global whose value is a constant in the DOL's data section (the translator can read `.sdata`/`.data` initial values) is static; or in the runtime patch the hot sites by backpatching the faulting instruction to a `call` thunk when the same (pc, page) faults more than N times (moot once the SDK replacement removes every register access) |
 
 ### P10. Translator-level gains in guest code (45 % of running time)
 
@@ -575,9 +615,10 @@ reported at hand-off from the previous session was a harness artifact.
   (SelectThread_801a9c08, WakeupThreadQueue, idle poll set),
   `runtime/include/fiber_manager.h` (GuestFiberManager), `runtime/src/hle/audio/ax_mix.cpp`,
   `runtime/src/hle/vi.cpp`, `runtime/src/guest_flat_memory.cpp` (fault-backed flat memory, `FlatWriteNeedsPolicy`).
-- Dolphin: `Source/Core/Core/HW/DSPHLE/UCodes/AX*.cpp` (AX HLE),
-  `Source/Core/Core/PowerPC/JitCommon/JitBackpatch` (fault backpatching),
-  `Source/Core/Core/Fifo.cpp` (dual-core sync, SyncGPU).
+- Not used as a source: Dolphin. Nebula is a native recompilation; the
+  specifications are the game's own code (Petari decompilation, symbol
+  table) and the Windows/Direct3D documentation. Former Dolphin pointers
+  removed.
 - Windows: `SetProcessInformation(ProcessPowerThrottling)` with
   `PROCESS_POWER_THROTTLING_EXECUTION_SPEED` and
   `PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION` (Windows 11 ignores
