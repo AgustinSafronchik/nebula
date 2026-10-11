@@ -264,6 +264,34 @@ DSP worker 5.8 %.
 | P0 crash dumps | The dump directory defaulted to the relative `generated\diagnostics`, which one `CreateDirectoryW` cannot create in an installed copy (the laptop crash of run 025441 failed with error 3). It is now resolved at startup: `GALAXY_CRASH_DUMP_DIR` (the launcher points it at the recording folder) or `%LOCALAPPDATA%\Nebula\crashdumps`, created component by component. The default dump keeps stacks, registers, referenced memory, module data, handles and the memory map; `GALAXY_CRASH_DUMP_FULL=1` writes full memory | `GALAXY_CRASH_TEST=1` (a worker thread writes to null 5 s after start): 100.7 MB dump written, `[crash]` lines carry the thread id |
 | P0 thread names | Every runtime thread calls `name_current_thread` (SetThreadDescription plus a `[thread] name= id=` line): simulation, render, window, DSP, deadline broker, async disc, THP decode, texture decode, PSO prewarm/compile/disk writer, HID input/output, audio, telemetry, profiler. The launcher's `threads.csv` gains a `name` column | names read back by the external sampler |
 
+Frame pipeline timeline (`GALAXY_FRAME_TIMELINE=1`, `frame_timeline.h`,
+digest `tools/perf/timeline_digest.py`): every VI edge, FIFO submission and its
+caller, render-thread start, guest-read completion, command-list submission,
+GPU start/end (timestamps mapped to QPC through `GetClockCalibration`), fence
+observation, PE delivery, token consumption, Present, DXGI frame statistics,
+DWM vblank timing, idle-loop waits and the publication that woke each one. The
+launcher records it in every recording (`timeline.bin` in the session folder).
+
+What it showed on the title route (9950X3D, 5090, 480p, Native10 behaviour):
+the game's `GXDrawDone` handed the whole frame (163 KB of FIFO) to the render
+thread and slept until the frame's PE finish, which arrived 5.6 ms later on
+average (p90 7.5 ms): 3.7 ms of render-thread parse and record, 0.15 ms of
+GPU, and 1.5 ms until the render thread's 1 ms fence poll noticed completion.
+The simulation thread was idle for 84 % of that window. On a slower CPU and
+iGPU the same chain grows while the game's own work fills the rest of the
+16.7 ms, which is the lag at every resolution with every unit partly idle.
+
+| Item | Change | Measured (title route, 9950X3D) |
+| --- | --- | --- |
+| P1.5 A: PE at consumption | A capture's PE finish/token are delivered when its command list is submitted (parse done, texture decodes joined), and its token resolves there, instead of at the GPU fence. The CPU never reads GPU results through guest memory (EFB copies stay GPU resources, peeks are asynchronous fields). `GALAXY_PE_EVENTS_AT_CONSUMPTION=0` restores fence delivery | draw-done window beyond recording 1.87 to 0.17 ms |
+| P1.5 B: streamed FIFO | When the live FIFO passes 32 KB inside a frame (`GALAXY_GX_FIFO_STREAM_KB`), the gather-pipe flush hands the completed bursts to the render thread through the ordered draw-done submission owner, so parse and recording overlap the game's own work as the hardware GP does. Never blocks: a full render queue or an active VI/sync capture or THP decode defers it by 8 KB | draw-done submit to PE finish 5.6 to 1.19 ms mean (p90 7.5 to 2.4 ms); about 5 chunks of 38 KB per frame; simulation thread submit cost 0.16 to 0.28 ms per frame |
+| Profiler crash | The 1 kHz sampling profiler (on in Detailed recordings and in `runtime-env.json`) unwound the suspended simulation thread with `RtlVirtualUnwind`; a garbage RSP from one frame faulted the next unwind inside ntdll and killed the game (minidump: `SimulationProfiler::run` -> `RtlVirtualUnwind` -> `RtlpUnwindPrologue` reading address 9; same signature as the laptop crash of run 025441, a worker at 3 % of a core). Each unwind is now SEH-guarded and every RSP must rise strictly below the TEB stack base; `runtime-env.json` defaults it off | 3 x 120 s with the profiler on: no crash, walk-faults=0 |
+
+Idle-loop wake sources (title route, per second): DSP worker 1,975,
+decrementer 801, PE/IOS host wakes 85, input 78, IOS 4. The simulation thread
+blocks and wakes about 3,000 times per second; two thirds of it is the DSP
+coprocessor's mail traffic, which the native JAudio mixer removes.
+
 Correction to plan P5: the runtime already calls `timeBeginPeriod(1)`
 (`ScopedTimerResolution`), opts the process and the simulation thread out of
 execution-speed and timer-resolution power throttling, raises the class to
