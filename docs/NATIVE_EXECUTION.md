@@ -477,6 +477,27 @@ working set / 809 MB commit with the discrete GPU, 906 / 778 MB with the
 iGPU, flat over 120 s. Pause menu and Home menu with the host mixer: no
 clipping or DC offset in the captured audio.
 
+## Native17 session 2026-10-11: exact guest profile, SDK math, device faults, idle guard
+
+The profiler's guest attribution (nearest preceding function record) charged
+out-of-line helpers to whatever translated function precedes them in the
+image: `ShapePacketUserData::init`, a model-setup routine, showed 6 % of
+guest samples. `[sim-profile-module-rva]` now prints module samples by
+16-byte RVA, and `D:/NebulaWork/native/tools/rva_profile.py` resolves them
+with the module's lld `/MAP`. Exact profile, gameplay route, 22,810 module
+samples: SelectThread 6.1 %, `native_savegpr` 3.4 % + `native_restgpr`
+2.0 %, everything else under 1.2 % per function.
+
+| Item | Change | Measured |
+| --- | --- | --- |
+| SDK paired-single math | 22 PSMTX/PSVEC/PSQUAT routines get lean host bodies (`lean_*` in native_api.h): plain float, memory results and f1/r3 returns only, plain stores like translated code (no per-store publication). They replace both the body and direct calls (`lean_sdk_math_symbol`); eager FPU (ABI 25) means no exact-FPU restart | bench (36 SDK functions, same harness): 60.4 to 39.0 ns/call mean; PSMTXConcat 98.3 to 6.6 ns, PSMTXCopy 60.9 to 3.1, PSVECNormalize 32.3 to 3.5. Differential test against the translated routines (main.dol loaded, 20,000 random trials each incl. aliased outputs, zero vectors, singular matrices): 0 mismatches, worst relative difference 3.8e-6 (PSMTXInverse 8.9e-4 on ill-conditioned input). Game A/B, 3 rounds: simulation thread 21.8 to 20.5 % (B lower in every pair) |
+| Device accesses under fastmem | Device classification is a CFG must-analysis (constants met at joins, volatile GPRs clobbered at calls, unexplained interior entries unknown); SDA words every store sets to one device base (GXInit's `__cpReg`, `__piReg`, `__peReg`, `__memReg`) load as that constant; an indexed access with a device-base constant and an unknown index (`__IPCRegs[i]`) is a device access. The checked helper also admits RAM, so a misclassified site is slower, never wrong. `[fastmem-hot-site]` names the faulting host instruction | handled faults per 100 s run 373,000 to 58,000 (reads 181,561 to 4,606); one fault costs 1.0 us on this host (`bench/fault_cost.cpp`; a flat RAM load 0.09 ns). Checked device sites 2,743 to 2,993 |
+| `_savegpr_N` / `_restgpr_N` | `bl` to the CodeWarrior register save/restore helpers lowers inline to their stw/lwz run off r11 (11,719 call sites): no call, GPR spill/reload, call-return checkpoint or per-word dirty tracking | module 352 to 380 MB. A/B within noise (18.3 vs 18.3 %); exact profile on the same route: module samples 22,810 to 21,658 (the helpers had 1,228), simulation-thread running samples -2.2 % |
+| Idle-loop guard | `GALAXY_IDLE_LOOP_GUARD_US` default 100 to 0: the idle wait no longer returns 100 us early before each VI edge (the SelectThread idle loop spun through that window, about 80 % of SelectThread's samples) | 3 rounds: simulation thread 18.6 to 17.3 % (lower in every pair); VI delivery lateness p99 0.52 to 0.57 ms; no repeated frames |
+
+Tried and not adopted: re-entering the slow checkpoint after every idle-loop
+batch (SelectThread samples unchanged; the spin was the guard window).
+
 ## Known simulation-thread stalls (from the 9950X3D A/B telemetry)
 
 - (Resolved, F9 pointer) Keyboard/mouse pointer mode waited for the current
@@ -502,7 +523,7 @@ clipping or DC offset in the captured audio.
 
 ## Verification
 
-`cargo test --workspace` for the translator (426 tests; the temp-directory
+`cargo test --workspace` for the translator (430 tests; the temp-directory
 tests need a writable `%TEMP%`); the runtime test targets (60, including
 `galaxy_native_fast_float_tests` built with `GALAXY_FAST_FLOAT=1`) compile
 against ABI 26 (the fastmem forms are clang-only and inert under MSVC); a smoke run of the intro route on the build host boots,
