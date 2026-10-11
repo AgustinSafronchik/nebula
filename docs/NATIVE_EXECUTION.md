@@ -292,6 +292,27 @@ decrementer 801, PE/IOS host wakes 85, input 78, IOS 4. The simulation thread
 blocks and wakes about 3,000 times per second; two thirds of it is the DSP
 coprocessor's mail traffic, which the native JAudio mixer removes.
 
+Gameplay route for headless measurement: `D:\NebulaWork\native\routes\gameplay.tsv`
+(built by `routes\gameplay.py` with `tools\make_route.py`) presses A+B at
+the title, picks file 1 with the pointer, plays it and runs loops with jumps
+and spins around the Comet Observatory from 45 s to 125 s. It needs a save
+seeded with its `galaxy.isfs.meta` NTFS streams (`nrun.ps1 -Nand` copies
+with robocopy; a save copied without them hangs boot before the first disc
+read). `GALAXY_PRESENT_SNAPSHOT_EVERY/_DIR` save every Nth present as PPM so
+a run without a display can be checked frame by frame.
+
+| Item | Change | Measured (gameplay route, 9950X3D, OS thread times over 130 s) |
+| --- | --- | --- |
+| DSP main-RAM DMA | Every native DSP main-RAM transfer was a one-slot rendezvous: the worker published the span, woke the simulation thread and blocked until it copied the bytes. Reads and writes now copy on the worker through the immutable RAM mapping, as the hardware DMA engine reads RAM while the CPU runs; ordering comes from the mailbox protocol and x86 store order. Writes still mark the renderer's dirty pages atomically; a write touching the CPU-tracked audio backing keeps the rendezvous. `GALAXY_DSP_DIRECT_MRAM_READS/WRITES=0` restore it | rendezvous 5.45 M (42,000/s) to 0; simulation thread 37.9 to 29.9 % of a core, DSP worker 21.4 to 9.2 % (with the idle-timer change below in the same build); idle waits 8,467 to 1,063 per second; VI 59.88/s and new-frame cadence unchanged |
+| Idle timer | The idle wait re-armed its high-resolution timer every wait; it stays armed while the target edge is unchanged (`GALAXY_IDLE_TIMER_KEEP_ARMED`) | included above |
+| Environment reads | The input poll read replay, script, stick and deadzone settings through `getenv_s` (a scan of the whole environment block) on every report. `read_env_string` and the numeric readers are cached per literal name once configuration is done | ucrt `strchr` 301 to 0 profile samples |
+| AI DMA stall | A masked AI DMA service more than 8 buffer periods (140 ms) behind ended the game ("AI DMA missed 8+ consecutive hardware buffer deadlines"; seen once in a headless route run with 10 VI edges pending). The missed periods are now dropped and the clock resumes at the newest boundary, logged as `[ai-dma-resync]` | unit test pins the behaviour |
+
+Profiler caveat: the sampler suspends the simulation thread, and a
+suspension lands on the return from a kernel call, so rows for syscall-heavy
+functions are inflated (GetThreadTimes shows about 3 us per call in the
+profile against 144 ns measured directly). Judge those rows by A/B runs.
+
 Correction to plan P5: the runtime already calls `timeBeginPeriod(1)`
 (`ScopedTimerResolution`), opts the process and the simulation thread out of
 execution-speed and timer-resolution power throttling, raises the class to
