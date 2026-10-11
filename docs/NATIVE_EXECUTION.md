@@ -404,6 +404,48 @@ square oscillator, stray releases). Oscillator type 10's phase modulation
 from the surround bus is played as a plain sine. `GALAXY_JAUDIO_HOST_MIXER=0`
 restores the native DSP on the same module.
 
+## Native15/16 session 2026-10-11: integrated GPU, display pacing, slow-CPU emulation
+
+`GALAXY_GPU_PREFERENCE=low` selects the minimum-power adapter (the
+desktop's AMD integrated GPU, 2 RDNA2 compute units, the HD 520 class) and
+`nrun.ps1 -Affinity` limits the process to chosen logical CPUs.
+
+| Item | Change | Measured |
+| --- | --- | --- |
+| GPU page fault with uber pipelines (Native15) | Hybrid mode removed the AMD iGPU device (DEVICE_HUNG) about 40 s into the route; force mode every run. DRED: page fault at a fixed VA 0x13f800000, no live or recently freed allocation, before op 0 of a new command list. A draw whose specialized shader samples no map left texture and sampler root tables unbound (the renderer skips null tables), so after a command-list reset they were undefined; the uber pixel shader samples every enabled map even when the combiner ignores it. Such draws now get a frame-cached table of null SRVs and the default samplers. Refuted on the way: an unbound matrix palette (always binding it changed nothing) | force mode 3 of 3 runs removed before, 0 after (4.86 M uber draws in 124 s); hybrid 480p: 59.96 new frames/s, no VI interval above 25 ms |
+| VSYNC ON intervals | VSYNC ON presents with interval round(refresh / 60) when the output runs at a multiple of 60 Hz within 1.5 % (120, 180, 240; 119/239 qualify), so each frame stays the same number of refreshes; other rates keep 1. VSYNC OFF (default) unchanged | not measurable headless (no output; DWM reports a virtual 60 Hz) |
+| Display stats | `[present-stats]` adds `refresh-hz` (EnumDisplaySettings of the swap chain's output) and `shown-refreshes(0/1/2/3/4+)` (how many refreshes each displayed frame stayed on screen, from DXGI frame statistics) | headless: refresh-hz=0, no statistics |
+| Clock reads | `now_ticks` keeps one shared CAS (the raw-counter CAS was redundant with the output clamp); the checkpoint body's sample decides "DEC not yet due"; AI-DMA dispatch reuses its fresh first sample | reads by site before: DEC fallback 37 %, AI dispatch 23 %, VI/DEC arbitration 13 %, VI waits 9 %, guest mftb 11 % of 177,000/s; one A/B pair 14.1 M to 11.0 M reads; CPU change within noise |
+| Census | `[host-census]` adds broker replacements and wakes | 3,800 and 1,630 per second; a waking SetEvent costs 1.34 us on this host, GetThreadTimes 162 ns, QueryThreadCycleTime 201 ns (the profiler's syscall rows overstate these) |
+
+Slow-processor emulation on the gameplay route (AMD iGPU, 480p, frame
+timeline): `GALAXY_DIAG_SIM_BURN_US` adds busy time to the simulation
+thread at each VI delivery, `GALAXY_DIAG_RENDER_BURN_US` to each render
+chunk.
+
+| CPUs | Added burn | Simulation thread | Render thread | New frames/s | Frames repeated |
+| --- | --- | --- | --- | --- | --- |
+| 4 logical | none | 22.3 % | 7.6 % | 59.958 | 0 |
+| 2 logical (one core) | none | 25.5 % | 10.6 % | 59.961 | 0 |
+| 4 logical | 6 ms/VI, 1.5 ms/chunk | 53.3 % (8.9 ms/frame) | 37.7 % | 60.000 | 0 |
+| 4 logical | 10 ms/VI, 2.5 ms/chunk | 78.6 % (13.1 ms/frame) | 56.0 % (9.3 ms/frame) | 59.861 | 8 in 85 s |
+
+Simulation and render work overlap: frames are lost only as a thread's
+own work approaches the 16.7 ms frame, not when their sum exceeds it.
+
+Tried and not adopted (A/B within run-to-run noise of about 2 points of
+simulation-thread CPU):
+- `GALAXY_PE_PRECLASSIFY=0` (skip the simulation thread's second FIFO
+  parse): simulation -0.75, render +1.9 points. The knob stays as a
+  diagnostic.
+- Turning adaptive call-return checkpoint counting off: checkpoint bodies
+  -23 %, no CPU change; reverted.
+- A module built without call-return checkpoints is 247 MB instead of
+  352 MB, but it cannot run: the same inline test carries the pending
+  flag-transfer check (boot failed with an RFI during a pending
+  transfer). Generation 18 has to keep a one-load transfer test after
+  calls.
+
 ## Known simulation-thread stalls (from the 9950X3D A/B telemetry)
 
 - (Resolved, F9 pointer) Keyboard/mouse pointer mode waited for the current
