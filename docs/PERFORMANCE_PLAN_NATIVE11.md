@@ -252,7 +252,22 @@ observed failure modes and their fixes:
    running at hand-off: `D:\NebulaWork\native\chain10m.log`, smoke label
    `rt11-mod10-flag8`; if it failed, the traced rerun is `rt11-flag-trace5`.
 
-How to continue: run `chain10m.ps1` (scratchpad of session 0d216f6c) or
+5. Last observed failure (chain10n, smoke `rt11-mod10-flag9`, traced
+   `rt11-flag-trace6`): a transfer set at Home Button RSO checkpoint site
+   `0x91F073E0` (external interrupt, thread switch to `0x807ACCA0` resuming
+   `0x804AB30C`), retention rejected (`mismatch=5`, expected), the RSO
+   function returned through its checkpoint macro, and the sidecar then
+   raised `[fatal] guest error at 0x804AC088: invalid static Home Button
+   RSO local return`. The sidecar generator (`crates/nebula-recomp-core/src/rso.rs`
+   and `generate_home_button_sidecar` in the CLI) emits, after every call
+   to another sidecar function, a static local-return validation; it must
+   emit `GALAXY_RETURN_IF_TRANSFER_PENDING(services);` between the call and
+   that validation (and before any other post-call code). The runtime side
+   already guards `home_button_rso_try_call` and `resume_home_button_rso_native`.
+   After that fix, rerun the chain; the next failure, if any, will again be
+   named by the `[flag-set]/[flag-retain]/[flag-take]` trace.
+
+How to continue: run `chain10n.ps1` (scratchpad of session 0d216f6c) or
 its three steps by hand (cargo test, `build-rt.ps1`, `gen-mod.ps1 -Gen
 gen10 -Mod mod10`, `smoke-app.ps1 ... -Module mod10 ... -Set
 GALAXY_FLAG_TRANSFER=1`). A failure prints either the entry assertion
@@ -379,11 +394,19 @@ Steps:
    the game expects). 2.6 ms per frame on a 185H means the decoder is
    scalar.
 3. Measure with `[thp-hle-video-join]`: wait-mean-us must be near zero.
+4. Confirmed: `runtime/src/native_thp_video.cpp` contains no SSE intrinsics at all (scalar IDCT, scalar color conversion); the keyboard poll (`collect_native_key_levels` over `kFunctionalVirtualKeys`, `native_host.cpp` line 8046) calls `GetAsyncKeyState` once per key per poll, which is the `NtUserGetAsyncKeyState` row in the laptop profile.
 
 ### P7. 1080p internal resolution on the iGPU
 
 Evidence: at EFB scale 3 the simulation thread share is unchanged (61 %),
-so the slowdown the user feels is the GPU. `[efb-copy-work]` reports
+so the slowdown the user feels is the GPU. Both laptop runs still present
+60.0 fps on average with `frame-ms(max)` 18.4 to 19.0 ms, so what the user
+sees at 1080p are per-frame spikes (occasional dropped presents: 11,700
+requested, 11,693 presented), not a lower average. `[efb-copy-work]` for the
+255 s run at 3x: 50,820 shader copies (200 per second) and 2,694 identity
+copies carrying 28.3 GB of payload, against 3.1 GB for the same copies at
+1x: each identity copy at 3x moves about 10.5 MB through the iGPU's shared
+memory bus, which is the first thing to remove. `[efb-copy-work]` reports
 76,134 EFB copies in 9 minutes (141 per second, more than two per frame)
 and 2.8 GB of identity-copy payload; at 3x scale every copy is 9x the
 pixels, and the Arc iGPU shares memory bandwidth with the CPU.
@@ -398,8 +421,16 @@ Steps:
    the 141 per second are bloom/depth-of-field intermediates that the game
    immediately downsamples. Add `GALAXY_EFB_COPY_SCALE_CAP` (default 1 for
    non-XFB copies when the EFB scale is above 1) and compare frame times.
-3. Skip identity copies (same source and destination layout, 2.8 GB per
-   session) with a cached-resource alias; the counter already separates them.
+3. Skip identity copies with a cached-resource alias; the counter already
+   separates them. The path is `renderer_d3d12.cpp` line 5484:
+   `detail::efb_identity_copy_box` selects a copy whose destination layout
+   equals the EFB color target, and `detail::record_efb_identity_copy`
+   issues a `CopyTextureRegion` of the whole scaled EFB (10.5 MB at 3x,
+   2,694 times in 255 s). Replace it by registering the EFB color texture
+   itself (or the previous frame's retired EFB target, which the renderer
+   already double-buffers for `peek`) as the copy destination for the
+   frames until the next EFB write, and only materialize a copy when the
+   EFB is next cleared while a consumer still references it.
 4. On integrated GPUs prefer `D3D12_HEAP_TYPE_UPLOAD` resources read
    directly by the GPU for vertex rings (UMA is already detected:
    `unified-memory=1`), and avoid readbacks (the depth peek field is
@@ -437,7 +468,7 @@ Steps:
 | Item | Evidence | Fix |
 | --- | --- | --- |
 | Pointer provider polls `GetAsyncKeyState` per key | 779 to 907 samples (`NtUserGetAsyncKeyState`), `install_host_pointer_transition_provider+0x1690` | Poll the keyboard once per report with `GetKeyboardState`, or move the poll to the input thread and publish a snapshot; raise `GALAXY_HOST_POINTER_POLL_CACHE_MS` to 8 |
-| `strchr` in a hot path | 1,559 samples; caller symbol misattributed (`basic_stringstream` +0x7360) | Build the profiler's two-level caller attribution (walk two frames for "other" samples) and find the `getenv_s`; the candidates are the `read_env_*` helpers in `native_host.cpp` lines 526, 1204, 1227, 1288, 1329, 2294 that are not `static const` cached |
+| `strchr` in a hot path | 1,559 samples; caller symbol misattributed (`basic_stringstream` +0x7360) | Confirmed candidates in `native_host.cpp`: `virtual_wiimote_count()` (line 523, a `getenv_s` per call, called from the input poll path), and the uncached generic readers `read_env_float_setting`, `read_env_int_setting`, `read_env_u64_setting`, `read_env_path` (lines 1197 to 1329) wherever a caller invokes them per poll or per frame instead of once into a `static const`. Cache every one of them; then re-profile |
 | `GetThreadTimes` | 898 samples at a 1 ms cache | Cache for 16 ms (a suspension candidate needs a whole retrace) or drop the CPU-time evidence in favor of the TSC-based gap test |
 | `QueryThreadCycleTime` | 242 samples | Same as above |
 | Deadline broker wake per DEC replace | `replace_once` 1,189 samples, `ZwSetEvent` 699 | Do not wake the worker when the new deadline is later than the one it sleeps toward (already) and when it is within 100 us of it; batch DEC rewrites that happen inside one checkpoint |
