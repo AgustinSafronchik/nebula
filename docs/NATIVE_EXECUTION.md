@@ -560,6 +560,18 @@ simulation thread 16.2/16.3/16.1 to 15.3/15.7/14.0 % of a core (mean 16.2
 to 15.0, lower in every pair); checkpoint bodies 1.27 M to 1.09 M per run;
 60.0 new frames/s and no repeats on both.
 
+| Item | Change | Measured |
+| --- | --- | --- |
+| String, GD and copy bodies (generation 20) | MSL strlen, strcmp, strncmp, strstr, strcasecmp (locale lower map through 0x805F51F8+0x38, sign-extended bytes, -1/0/1), MR::isEqualString, nw4r::lyt::detail::EqualsResName (strncmp of 16), the three J3DGDWrite_u32 copies, GDPadCurr32 and memcpy (0x80004338: a byte copy that runs backward when src < dst; RAM spans move with memmove, other spans keep the device-aware byte path). The five WPADRead copies keep the translated memcpy and its checkpoint for the input trace. The string routines read no device state and store nothing, so a checkpoint inside their loops only bounded interrupt latency | `bench/diff_strings.cpp` against generation 19, 20,000 trials per routine (equal, prefix, case-only, null and empty patterns, n of 0 and 0xFFFFFFFF, overlapping copies both ways, every GD pointer alignment): 0 mismatches, 0 contract violations. Profile share before: about 3.5 % of module samples. 32 MB L3 CCD A/B, 3 rounds: 21.7/22.6/21.8 to 23.0/21.0/20.3 % (mean 22.0 to 21.4), within the route's noise |
+
+Cache size: the same module and route with the process pinned to one CCD
+of the 9950X3D, 2 rounds each: 96 MB L3 CCD 15.5/17.3 %, 32 MB L3 CCD
+(higher clock) 23.9/24.4 % of a core. The simulation thread needs about
+1.5 times the CPU time with a third of the L3, so laptop CPUs (24 MB on
+the Core Ultra 9 185H, 3 MB on the i7-6500U) are dominated by the
+translated code's footprint; A/B runs from here on are pinned to the
+32 MB CCD (`tools/ab-mod.ps1 -Affinity 4294901760`).
+
 ## Known simulation-thread stalls (from the 9950X3D A/B telemetry)
 
 - (Resolved, F9 pointer) Keyboard/mouse pointer mode waited for the current
