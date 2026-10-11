@@ -259,6 +259,12 @@ host implementations; keep them.
 
 ## 4. Audio: native JAudio mixer, no DSP, no ucode
 
+Status (Native14): steps 1 to 3 are done at the DSP command boundary.
+`DspBoot` and `DSPSendCommands2` are host calls; the host mixer runs on the
+simulation thread when the game releases the last channel group (0.28 % of
+a core on the gameplay route). The AI layer (step 1, second half) and
+mixing on the audio output thread (step 4) remain.
+
 RMGE01's audio is JAudio (JAS), the game's own middleware. JAudio keeps the
 state of every playing voice in `JASDsp::TChannel` blocks in guest RAM,
 written by the game's own code (`JASChannel::initialUpdateDSPChannel`

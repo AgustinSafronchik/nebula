@@ -350,6 +350,60 @@ are limited to static screens. Headless runs have no audio endpoint (the
 runtime keeps starting audio-recovery threads) and no DXGI frame
 statistics; display pacing needs a recording from a real display.
 
+## Native14 session 2026-10-11: host JAudio mixer
+
+`DspBoot` (0x804961E0) and `DSPSendCommands2` (0x804962C0) are host calls
+(translator host-call list; `GALAXY_JAUDIO_HOST_MIXER=1`, default on). No
+DSP task boots, so the DSP worker thread, mailbox handshakes, MRAM/ARAM
+transfers and DSP interrupts are gone. The game's audio thread, JASDriver
+and every JASChannel update still run as translated code; the command words
+it would mail become calls into `JAudioHostMixer`
+(`runtime/src/jaudio_host_mixer.cpp`): 0x81 setup copies DSPRES_FILTER and
+the ADPCM table, 0x8E sets the wave base (VARAM), 0x82 starts a frame and
+latches FX_BUF, and the release of channel group 3 mixes one subframe and
+posts AUDIOMSG_DSP to the JASAudioThread queue as `DSPCallback` does. The
+setup and VARAM callbacks run at once.
+
+What a subframe computes was read from the game's DSP program (0x1F00 bytes
+at 0x805D8460, disassembled with the translator's decoder) and restated as
+host integer code: AFC 4-bit/2-bit and PCM8/16 decode with the program's
+record bookkeeping (`_64` leftover samples, `_70` next block, `_74` samples
+left; JASAramStream reads `_74 + _64` and `_70` to refill its ring), the
+64-phase 4-tap DSPRES_FILTER resampler with the 4-sample tail in `_78`,
+FIR (`mode & 0x1F` taps) and the one-sample-late IIR, six bus sends ramped
+over 64 samples with per-bus delay from the `_E` history, the auto mixer's
+quarter-sine pan/surround gains and effect sends, four FX feedback delay
+lines with optional 8-tap FIR, the surround fold-down (0x6784, 0xB820,
+0x47E0 matrix), center at 0x5A82, the inverted-right bus, and output =
+bus x mixer level / 4096. The oscillator wave tables 11/12 are regenerated
+every subframe as the program does. Gain chain: channel volume / 65536 on
+the bus, x4 at mixer level 0x4000; the Dusk HLE's /0x2EE0 was the 1.37x
+level error measured earlier.
+
+| Measure (9950X3D, gameplay route, same runtime and module) | Native DSP | Host mixer |
+| --- | --- | --- |
+| Simulation thread, % of a core (3 runs each) | 21.7, 23.6, 22.8 | 19.2, 20.0, 21.6 |
+| DSP worker thread | 5.8, 7.0, 6.2 | none |
+| Process total (2 rounds; a 1 s uber-compile thread excluded) | 51.1, 47.1 | 37.9, 37.9 |
+| Mix time inside the host calls | | 247 ms over 88 s (0.28 % of a core) |
+| AI buffer misses (`late-over-buffer`, `missed-buffer-estimate`) | 0 | 0 |
+
+Audio against the native DSP on the same route (`audcmp.py`): level ratio
+1.001 (L) / 1.003 (R), mean log-spectrum correlation 0.9999, band
+differences at most 0.008 log10 (below 0.1 dB) from 0 to 16 kHz; the Dusk
+HLE measured 0.9945, 1.37x louder and +3.4 dB treble. 240 s title idle:
+216 s of continuous PCM16 stream music, no gaps, the 27 s title loop
+repeating. Home menu opens and closes with gameplay continuing.
+
+Route coverage (counters in the `[jaudio]` shutdown line): AFC, PCM16,
+auto mixer and FX lines ran; FIR, IIR, oscillators, PCM8 and the
+main-memory PCM formats (0x20/0x21) did not occur on the route or at the
+title and are covered by unit tests only (`galaxy_jaudio_mixer_tests`:
+gain chain, ramp, AFC bookkeeping and loop, FX delay, pan, FIR delay, IIR,
+square oscillator, stray releases). Oscillator type 10's phase modulation
+from the surround bus is played as a plain sine. `GALAXY_JAUDIO_HOST_MIXER=0`
+restores the native DSP on the same module.
+
 ## Known simulation-thread stalls (from the 9950X3D A/B telemetry)
 
 - (Resolved, F9 pointer) Keyboard/mouse pointer mode waited for the current
@@ -365,7 +419,7 @@ statistics; display pacing needs a recording from a real display.
 | --- | --- |
 | F5 (float) | FPR/PS1 residency is implemented (`guest_resident_float`, `_r` helper overloads on `fpr[32]`/`ps1[32]` locals) and off: under the exact model it measured 86.8 (store-all) and 87.9 ns (written-only) against 83.2 without it, because the exact fallback calls force spills. To be re-measured on top of fast float, where the float helpers make no calls |
 | F6 (checkpoints) | Branch and call-return checkpoints remain: counter, watermark and event-mask loads through the services table at every backward branch and call return |
-| F8 | DSP module codegen at the same standard |
+| F8 | Superseded: the DSP no longer runs by default (host JAudio mixer, Native14) |
 | F10 | PE tokens at FIFO consumption instead of GPU fence |
 | F12, F14 | Compact per-layout vertex stride; non-blocking pipeline misses (needs a real uber pipeline). The remaining texture spikes are resource creation, not decode; placed heaps or recycled resources are the fix |
 | F16 | Working-set investigation (2.8 to 5.4 GB observed) |
