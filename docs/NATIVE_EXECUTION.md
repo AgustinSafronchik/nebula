@@ -499,8 +499,15 @@ samples: SelectThread 6.1 %, `native_savegpr` 3.4 % + `native_restgpr`
 
 | PE event preclassification (Native19) | The simulation thread's second FIFO parse (PE draw-done/token preclassification) runs its FifoParser in classify-only mode: XF and indexed loads leave the state untouched, and a cached display list with no PE register write replays as its CP writes and last BP command (the classifier reads only CP registers for draw sizes, the BP mask and PE registers). `GALAXY_PE_CLASSIFY_VERIFY=1` runs a full-mode classifier on the same bytes and reports differences | verify run (boot, title, file select, gameplay, Home menu): 24,000 chunks, 0 differences. Exact profile: simulation-thread FIFO parser samples 3,042 to 368, running samples -7 %. Runtime A/B, 3 rounds: simulation thread 18.1 to 16.1 % (lower in every pair), render thread unchanged |
 
+| Diagnostic gates | 68 single-flag env gates (`static const bool` locals, a thread-safe-static guard check per call) use a constant-initialized atomic cache; several sit on every runtime-dispatched guest call | exact profile: gate samples about 420 to 100 (about 1 % of the simulation thread); A/B within noise |
+| Idle-wait diagnostics | `[idle-loop-sleep]` adds skip reasons (transfer/off/mask/dispatch/vi-boundary/vi-due/short/levels/retest) | 90 s gameplay: 121,678 waits; skips 29,208 short (inside the 250 us AI-DMA margin), 1,031 device levels, 572 latch mask, 517 VI due |
+
 Tried and not adopted: re-entering the slow checkpoint after every idle-loop
 batch (SelectThread samples unchanged; the spin was the guard window).
+`GALAXY_REALTIME_VI_AUDIO_DEADLINE_MARGIN_US=0` (sleep through the AI-DMA
+margin): simulation thread 17.2 to 16.6 % (not in every pair), AI-DMA service
+lateness mean 96 to 230 us and one event later than a whole buffer; the event
+wake is less punctual than the armed timer, so the margin stays.
 
 ## Known simulation-thread stalls (from the 9950X3D A/B telemetry)
 
