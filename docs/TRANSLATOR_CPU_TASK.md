@@ -102,3 +102,28 @@ Float registers as typed locals (gap "Later" list); small-leaf inlining across s
 
 ## Runtime changes
 (filled in by the task: file, line, what, why)
+
+Module ABI stays 27 for every change below. Each is header-only and additive:
+a module built without the new flag never names the new helpers.
+
+1. `--hw-float-conversions` (work item 1.1)
+   - `runtime/include/galaxy/native_fast_paths.h`:
+     - Line 259: new section "Hardware float conversions": `widen_f32_hw`
+       (271), `narrow_f64_hw` (276), the lane selectors `widen_single_lane<Hw>`
+       (284) and `narrow_paired_lane<Hw>` (293), `load_fpr_single_hw` (301)
+       and `store_fpr_single_hw` (316).
+     - `psq_load` and `psq_store` are now wrappers over `psq_load_impl<Hw>`
+       (357) and `psq_store_impl<Hw>` (440), with new `psq_load_hw` (429)
+       and `psq_store_hw` (530). With `Hw = false` the bodies are unchanged:
+       the template parameter only selects the lane conversion.
+     - Resident overloads: `load_fpr_single_hw_r` (1356),
+       `store_fpr_single_hw_r` (1370), `psq_load_r_impl<Hw>` (1381),
+       `psq_load_hw_r` (1455), `psq_store_r_impl<Hw>` (1466) and
+       `psq_store_hw_r` (1514). `psq_load_r`/`psq_store_r` are wrappers over
+       these, in the same way.
+     - Why: the generated code calls these helpers. The old helpers keep the
+       flag-off path.
+   - `runtime/src/native_hw_float_conversion_tests.cpp` (new) and
+     `CMakeLists.txt` lines 886-888, 1107, 1154: the
+     `galaxy_native_hw_float_conversion_tests` target (`ctest -R
+     native_hw_float_conversion`).
