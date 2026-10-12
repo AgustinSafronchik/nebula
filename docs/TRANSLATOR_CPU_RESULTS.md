@@ -29,10 +29,20 @@ plus every flag. Every new flag is off by default, and with all of them off
 the generated source is byte-identical to the base commit's output (pinned
 by the flag-off tests).
 
-Instruction counts in this document come from clang 18 on x86-64 Linux
-(`-O2 -mavx2 -mfma -mmovbe -fwrapv -fno-strict-aliasing`, `GALAXY_FASTMEM=1`,
-`GALAXY_FAST_FLOAT=1`). The module itself is built with clang-cl. The counts
-are the fall-through path from entry to `ret`, cold blocks excluded.
+Instruction counts in this document were measured on x86-64 Linux, not
+estimated:
+
+- The emitted C++ for a representative sequence is compiled with clang 18
+  using the module's flags (`-O2 -mavx2 -mfma -mmovbe -fwrapv
+  -fno-strict-aliasing`, `GALAXY_FASTMEM=1`, `GALAXY_FAST_FLOAT=1`) and
+  linked into a driver.
+- The driver runs each body 1,000 times with realistic state: a mapped flat
+  view, normal float data, a published inline gate with adaptive call
+  returns, and an empty event mask.
+- `valgrind --tool=callgrind` counts the instructions each body retires,
+  divided by the 1,000 runs.
+
+The module itself is built with clang-cl, so expect small differences.
 
 ---
 
@@ -93,16 +103,15 @@ After:
     galaxy::fast::store_fpr_single_hw(flat_guest_base, context, 1u, memory, context->gpr[3] + 0x0000000Cu, services, 0x80004004u);
 ```
 
-x86 hot path of `lfs f1,8(r3); lfs f2,16(r3); fmuls f3,f1,f2; stfs f3,12(r3)`
-(the body of a translated function, prologue included): **84 to 45
-instructions**. Each `lfs` is now `movbe` + `vmovd` + `vcvtss2sd` + two
+Retired x86 instructions for `lfs f1,8(r3); lfs f2,16(r3); fmuls f3,f1,f2;
+stfs f3,12(r3)` (the body of a translated function, prologue included):
+**79 to 45**. Each `lfs` is now `movbe` + `vmovd` + `vcvtss2sd` + two
 `vmovsd` stores (fpr, ps1). The `stfs` is the `vcvtsd2ss` that `fmuls`
 already produced plus one `movbe` store, behind the gather-pipe test. Before,
 each `lfs` was 15 instructions with two branches, and the `stfs` slice was
 about 20 with a variable shift.
 
-`psq_l f3,0(r5); ps_add f3,f3,f3; psq_st f3,8(r5)`: **117 to 78
-instructions**.
+`psq_l f3,0(r5); ps_add f3,f3,f3; psq_st f3,8(r5)`: **114 to 78**.
 
 ### Risks
 
@@ -247,16 +256,19 @@ Resident body, before and after:
     if (const std::uint64_t counted__ = galaxy::call_return_checkpoint_due_g(services); counted__ != 0u) [[unlikely]] { shared_counted__ = counted__; shared_site__ = 0u; goto shared_call_return__; }
 ```
 
-x86 per call-return site, read from the compiled resident form:
+Retired x86 instructions for a body of two direct calls, each followed by
+its call-return checkpoint (prologue, calls and epilogue included):
+non-resident **69 to 41**, resident **74 to 41**. Per call-return site,
+read from the same assembly:
 
 | Path | Before | After |
 | --- | --- | --- |
 | Adaptive (gameplay, AI DMA playing) | 26 instructions: 10 loads, 9 branches | 13 instructions: 6 loads (3 RIP-relative), 4 branches |
 | Non-adaptive | 14 instructions | 9 instructions |
 
-The non-resident macro form goes from 42 to 20 instructions per site
-(two-call probe: 83 to 41). Its transfer test now runs only on the cold
-path; a fast-path pass implies an empty event mask.
+The non-resident macro form compiles to the same two sequences. Its
+transfer test now runs only on the cold path, because a fast-path pass
+implies an empty event mask.
 
 ### Risks
 
