@@ -494,3 +494,191 @@ before `__init_hardware`.
 4. Boot and routes. A boot run with `GALAXY_TRACE_*` off must reach the title
    exactly as `$RELEASE` does, since the boot path is where HID2 is set. A/B
    on the 32 MB CCD steady scene.
+
+---
+
+## 2.1 EABI register synchronization (`--abi-call-sync`, `--abi-exit-sync`)
+
+### Design
+
+Register residency (`crate::residency`) keeps GPRs, LR, CTR and, with
+`--experimental-guest-resident-float`, the FPR/PS1 file in host locals. It
+treated every translated call as an opaque boundary. Before the call it
+stored every local the function writes anywhere; after it, it reloaded every
+local the function uses. A `return;` stored every written local. Measured
+on the probe corpus: 5 stores and 5 reloads around each direct call.
+
+The two flags apply the PowerPC EABI contract instead, at the boundaries
+where it holds:
+
+- **Calls** (`--abi-call-sync`). This covers a `bl` to a translated function
+  entered at its start, and a `bctrl`/`blrl` through
+  `fast::call_guest_indirect`. Before the call, only written locals a callee
+  may read are stored: r3-r10, f1-f8, r1/r2/r13, the non-volatile r14-r31 and
+  f14-f31, and LR. After the call, only the results r3/r4 and f1/f2 are
+  reloaded. Volatile non-arguments (r0, r11, r12, CTR, f0, f9-f13) are
+  neither stored nor reloaded, and nor are non-volatile registers, which the
+  callee preserves.
+- **Returns** (`--abi-exit-sync`). A `blr` stores only what a caller may
+  observe: the results, the non-volatile registers and LR. It no longer
+  stores volatile scratch such as r0 (`mflr r0`/`mtlr r0` in every non-leaf
+  function).
+
+The "safer variant" is kept on purpose: dirty non-volatile registers are
+still stored before a call and at a return. The callee's prologue saves the
+true values to the stack frame, so guest memory is unchanged. The context
+also stays correct for non-resident functions (about 38 % of the module,
+see ledger T-RESIDENCY-FALLBACK), which read registers straight from it.
+
+The translator marks eligible sites in the lowered text:
+`GALAXY_ABI_CALL(0x<pc>u);` before a linked call and `GALAXY_GUEST_RETURN;`
+for a `blr`. Both are no-op macros in `galaxy/native_api.h`, so a body the
+residency pass leaves alone compiles as before. The pass replaces them with
+the contract's sequences. A marker whose next synchronizing call is not a
+translated or indirect guest call is dropped, so that call keeps full
+synchronization. This covers hooks, `call_guest_resolved`, natives and
+wrappers. A marker is also dropped at a label or when its block closes.
+
+**Analysis** (`crate::ppc_dataflow`, `ModuleAbi::analyze`) runs before
+lowering, over every translated function:
+
+1. Effect decoder for every lowered form, including the implicit operands:
+   LR, CTR, CA/SO, CR0/CR1 of record forms, and the lmw/stmw runs. The
+   `bl _savegpr_N`/`_restgpr_N` helpers, which the translator lowers in
+   place, are modelled as their register effects (read r11 and rN..r31, or
+   write rN..r31), not as calls.
+2. Backward liveness per function. A call uses the EABI model, a branch to
+   another function is a tail call, and `bctr` makes everything live.
+3. Per function: volatile non-argument registers read at entry
+   (`entry_extra`, stored by its callers), and non-volatile registers written
+   without being saved (`clobbers`). `clobbers` is transitive over direct
+   calls, tail calls and indirect calls (which may reach any address-taken
+   function), and hidden by registers the function itself saves and
+   restores.
+4. Per call site: volatile registers the caller reads after the call before
+   rewriting them. These are computed with a precise argument model, a
+   fixed point over the call graph of the argument registers each callee
+   really reads, so `bl A; bl B` does not count B's unused argument
+   registers. The union over the module is `always_synced`: those registers
+   are stored and reloaded at every call and stored at every return.
+5. **Opt-out list.** These functions keep full synchronization at their own
+   calls and returns and when called directly:
+   - host substitutions and pure helpers (`native`);
+   - functions with an instruction the decoder does not model
+     (`undecodable`);
+   - functions with a `bl` into their own body (`internal-link`; `bl $+4` is
+     modelled exactly).
+6. **Indirect calls.** They use the union of `entry_extra` and `clobbers`
+   over the address-taken functions: start addresses found as a word in any
+   DOL section, or built by `lis` with `addi`/`ori`. If an opted-out
+   function is address-taken, every indirect call stays fully synchronized.
+
+The opt-out list and every non-ABI fact are written to `abi_contract.json`
+next to the shards (the module manifest for this feature). The CLI prints
+its path. It holds:
+
+- counts: functions, opted out, functions with non-ABI facts, call sites
+  using the contract;
+- `alwaysSynced`;
+- the indirect-call extras;
+- one row per opted-out function with its reason;
+- one row per function with `entryExtra`/`clobbers`/`readsAfterCalls`.
+
+### Emitted code (call_direct probe: prologue, two `bl` to a frame callee, epilogue)
+
+Before (`$RELEASE`, each call):
+
+```
+glr = 0x8070F018u;
+context->pc = 0x80701000u;
+{ context->gpr[0] = gr0; context->gpr[1] = gr1; context->gpr[3] = gr3; context->gpr[31] = gr31; context->lr = glr; rmge01::fn_80701000(context, memory, services); gr0 = context->gpr[0]; gr1 = context->gpr[1]; gr3 = context->gpr[3]; gr31 = context->gpr[31]; glr = context->lr; }
+...
+{ context->gpr[0] = gr0; context->gpr[1] = gr1; context->gpr[3] = gr3; context->gpr[31] = gr31; context->lr = glr; return; }
+```
+
+After (`--abi-call-sync --abi-exit-sync`):
+
+```
+glr = 0x8070F018u;
+context->pc = 0x80701000u;
+{ context->gpr[1] = gr1; context->gpr[3] = gr3; context->gpr[31] = gr31; context->lr = glr; rmge01::fn_80701000(context, memory, services); gr3 = context->gpr[3]; }
+...
+{ context->gpr[1] = gr1; context->gpr[3] = gr3; context->gpr[31] = gr31; context->lr = glr; return; }
+```
+
+The call-return checkpoint's cold block, the interior-entry stubs and every
+unmarked boundary keep full synchronization.
+
+### Measured (asm loop, x86 instructions)
+
+Measured with the asm loop (see "Measurement loop" below). The base is
+`$RELEASE` plus the item 1 flags. Static is the Win64 assembly; dynamic is
+callgrind per call.
+
+| Probe | Static before | Static after | Dynamic before | Dynamic after |
+| --- | --- | --- | --- | --- |
+| call_direct (2 calls) | 175 | 172 | 96 | 86 |
+| call_virtual (bctrl) | 162 | 158 | 98 | 90 |
+| int_alu (exit stores) | 53 | 31 | 46 | 28 |
+| int_load (exit stores) | 42 | 11 | 35 | 8 |
+| carry | 42 | 35 | 35 | 28 |
+| dcbz_line | 66 | 58 | 44 | 38 |
+| all 21 measured probes | 1943 | 1858 | 1034 | 948 |
+
+Float residency on top (`--experimental-guest-resident-float`) now pays,
+because floats no longer sync at every call and return: float_single 58 to
+52, paired 110 to 98, all probes 948 to 929.
+
+### Risks
+
+All failure modes are the same class: a guest register's value differs from
+the hardware without a crash. Wrong physics, animation or menu state is the
+symptom.
+
+- **A callee that breaks the EABI without the analysis seeing it.** Examples:
+  hand-written assembly that keeps a value in a volatile register across a
+  call, or reads a caller's non-volatile register without saving it. The
+  analysis reports a non-volatile write as "saved" when the function also
+  reads the register at entry. A function that takes an input in r31 and
+  returns it modified would be missed. Mitigation: the opt-out list and the
+  `nonAbi` rows. Check them against the RMGE01 symbol map. Unknown targets
+  and aliases (calls into a function's interior) always keep full
+  synchronization.
+- **Opted-out callers.** An opted-out function (local subroutine, unmodelled
+  form) that reads a volatile register after calling an ABI function would
+  see the callee's stale value, because the callee's return no longer
+  stores it. Only hand-written assembly does this.
+- **Indirect calls.** These rely on the address-taken scan. A function
+  pointer computed some other way, for example base plus offset arithmetic,
+  is not seen. The scan over-approximates: every data word equal to a
+  function start counts.
+- **Runtime readers of the context during a call.**
+  `call_guest_indirect_boundary` (an event pending or a withheld target)
+  reads LR, r2 and the arguments, all stored. Hooks reading other volatile
+  registers would see stale values.
+
+### Validation (Windows)
+
+1. `$RELEASE --abi-call-sync --abi-exit-sync`: the module builds with
+   clang-cl `/W4 /WX`.
+2. Read the generation output:
+   - `abi_contract.json`: record `optedOut`, `nonAbiFacts`, `abiCallSites`,
+     `alwaysSynced` and `indirectCall`;
+   - `alwaysSynced` should be `-` or a few registers; if it is large, attach
+     the file to the report;
+   - `indirectCall` must not be null unless an opted-out function is
+     address-taken;
+   - every `optOut` row should be a known assembly or OS routine
+     (`OSSaveContext`, `__OSPSInit`, `PPCMtmsr`, ...).
+3. Differential harnesses against `$RELEASE`: `diff_sdkmath`, `diff_tier2`,
+   `diff_tvec3`, `diff_strings`, `diff_gx`.
+4. Routes: boot to title, gameplay route, Home menu, save, prologue movie.
+   Compare frame dumps.
+5. Bisect a miscompile:
+   - `NEBULA_RESIDENCY_ADDRESS_RANGE=lo-hi` limits residency, and so these
+     flags, to a function range;
+   - each flag also works alone (`--abi-exit-sync` without
+     `--abi-call-sync`).
+6. A/B `ab-affinity` on the 32 MB CCD, 3 rounds: simulation-thread share,
+   module and `.text` size. Run it with and without
+   `--experimental-guest-resident-float`.

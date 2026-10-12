@@ -202,4 +202,16 @@ a module built without the new flag never names the new helpers.
    - `runtime/src/native_assume_paired_singles_tests.cpp` (new) and its
      `CMakeLists.txt` target `galaxy_native_assume_paired_singles_tests`.
    - No runtime code changes.
+6. `--abi-call-sync` / `--abi-exit-sync` (work item 2: registers that trust
+   the ABI)
+   - `runtime/include/galaxy/native_api.h` lines 6596-6602: the macros
+     `GALAXY_ABI_CALL(call_pc)` (a no-op statement) and
+     `GALAXY_GUEST_RETURN` (`return`).
+     - The translator marks linked calls and `blr` with them. The residency
+       pass replaces them with the EABI store and reload sequences, so they
+       remain only in bodies the pass leaves on the context, where they
+       compile to the old code.
+   - No runtime code changes.
+   - The opt-out list is a generated file, `abi_contract.json`, next to the
+     shards. Nothing in the runtime reads it.
 
