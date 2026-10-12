@@ -310,3 +310,133 @@ implies an empty event mask.
    counts, only a higher simulation-thread share.
 5. Routes: gameplay, Home menu, boot, save, prologue movie. A/B on the 32 MB
    CCD steady scene, 3 rounds paired.
+
+---
+
+## 1.3 Flat-view-only fastmem modules (`--flat-view-only`)
+
+### Design
+
+Generation 25's `fast::flat_base` lets the compiler assume the flat view is
+non-null in a fastmem module, which removed the duplicate null-view block
+around every translated load and store. Three kinds of sites never went
+through `flat_base` and still carried a null test plus a region-table
+fallback (`resolve_guest`), or always took the checked path:
+
+| Site | Before | With the flag |
+| --- | --- | --- |
+| Lean host bodies, force-inlined at their call sites (TVec3, JMath copies, SDK math, GD writers, strings) | `lean_guest_span`: null and struct-size test, then `resolve_guest`. `cstring::view`: null test, then the checked byte loads. Three of these per inlined TVec3 operation | `assumed_flat_view(memory) + address`, with `__builtin_assume(base != nullptr)` as in `flat_base` |
+| `stmw rS,d(rA)` with rS <= 24 | `guest_store_multiple_gprs<rS>` on every build: trace gates, a host-overlap test, `resolve_guest_fast`, a per-word fallback, and a call that the residency pass treats as a full sync point | One flat store per register (`store_stack` from r1), as rS > 24 already did |
+| `dcbz` | `guest_zero`: `resolve_guest`, then a byte loop | `fast::zero_line`: one alias-table test, then a 32-byte `memset` through the view. A line outside RAM (the locked cache) still goes to `guest_zero` |
+
+`dcbz_l` (locked cache), `lwbrx`/`stwbrx` (rare) and the checked device
+sites are unchanged. The flag defines `GALAXY_FLAT_VIEW_ONLY 1` in
+`functions.h`. It needs `--fast-float`, which makes the module fastmem, and
+both flat RAM directions.
+
+### Emitted code (stmw r22,8(r3); dcbz r3,r4)
+
+Before:
+```cpp
+    const std::uint32_t ea_80004000 = context->gpr[3] + 0x00000008u;
+    galaxy::guest_store_multiple_gprs<22u>(context, memory, ea_80004000, services, 0x80004000u);
+    ...
+    galaxy::guest_zero(memory, ea_80004008 & 0xFFFFFFE0u, 32u, services, 0x80004008u);
+```
+After:
+```cpp
+    galaxy::fast::store<std::uint32_t>(flat_guest_base, memory, ea_80004000 + 0x00000000u, context->gpr[22], services, 0x80004000u);
+    ... one per register to r31 ...
+    galaxy::fast::zero_line(flat_guest_base, memory, ea_80004008, services, 0x80004008u);
+```
+
+Retired instructions per execution:
+
+| Sequence | Before | After |
+| --- | --- | --- |
+| `stmw r22` to the stack, including the checked helper | 75 | 33 |
+| `dcbz` | 28 | 17 |
+| Inlined `TVec3::operator+=` (`lean_tvec3_add_assign`) | 51 | 20 |
+
+In resident bodies, `stmw` is also no longer a full synchronization point.
+
+### Risks
+
+- The view is assumed in the inlined host bodies exactly as translated code
+  already assumes it. The runtime refuses to start a fastmem module without
+  the view (`kModuleMemoryFlagRequiresFlatView`). An access outside RAM
+  faults into the vectored handler, as a translated load or store would.
+- `stmw` loses its trace gates (`trace_fileloader_temp_writes`,
+  `trace_u32_store`). These are diagnostics, and the flat `stw` path never
+  had them.
+- `dcbz` through the view does not trace audio-control zeroing
+  (`trace_audio_control_writes`), a diagnostic.
+- Per-register `stmw` adds inline stores. clang merges consecutive
+  byte-swapped stores, so the measured `stmw r22` path is 33 instructions
+  with no call.
+
+### Validation (Windows)
+
+1. `ctest -R native_flat_view_only`. Under a clang-cl runtime build the
+   flat-view-only arms are active, and the test prints "active".
+2. `$RELEASE --flat-view-only`. The module builds with clang-cl. Grep checks:
+   - `grep -c "guest_store_multiple_gprs" functions_*.cpp` is 0.
+   - `grep -c "galaxy::guest_zero(memory, ea" functions_*.cpp` is 0.
+   - `grep -c GALAXY_FLAT_VIEW_ONLY functions.h` is 1.
+3. `diff_tvec3`, `diff_strings`, `diff_sdkmath`, `diff_tier2`, `diff_gx`:
+   0 mismatches. The lean bodies run their flat-view-only arms in the module
+   under test.
+4. Routes (gameplay, Home menu, boot, save, prologue movie) and the
+   `[fastmem]` fault counts at exit. These must not grow: no new site faults,
+   because every switched site addresses RAM.
+5. A/B on the 32 MB CCD steady scene (3 rounds paired), plus `.text` size.
+
+---
+
+## 1.4 Stack stores through r11 (`--stack-r11-stores`)
+
+### Design
+
+Gap item 1 says to skip the gather-pipe test for r1- and r11-relative
+stores. Generation 25 did r1 (`fast::store_stack`). CodeWarrior's register
+save helper is called as:
+
+```
+addi r11, r1, d
+bl   _savegpr_N
+```
+
+The helper stores rN..r31 at `r11 - 0x80 + 4N`, and the inline `_savegpr`
+expansion (11,719 call sites) emitted those stores with `fast::store`, which
+includes the gather-pipe test. With the flag, a save run uses
+`fast::store_stack` when r11 is proven to point at the current frame. The
+proof: the instruction before the `bl` is `addi r11,r1,d`, and the `bl` is
+neither a branch target nor an interior entry, so control can only arrive
+from that `addi`. Otherwise the stores keep the test. Restores are loads,
+which never had the test. Requires `--experimental-flat-ram-writes`.
+
+### Emitted code (addi r11,r1,0x60; bl _savegpr_25)
+
+Before:
+```cpp
+    galaxy::fast::store<std::uint32_t>(flat_guest_base, memory, context->gpr[11] + 0xFFFFFFE4u, context->gpr[25], services, 0x80004004u);
+```
+After:
+```cpp
+    galaxy::fast::store_stack<std::uint32_t>(flat_guest_base, memory, context->gpr[11] + 0xFFFFFFE4u, context->gpr[25], services, 0x80004004u);
+```
+The seven stores of `_savegpr_25`: **75 to 26** retired instructions. Each
+store was a masked compare and branch plus the store; it is now one `movbe`.
+
+### Risks
+
+None for guest state. `store_stack` writes the same bytes, and an address
+that is not RAM still faults into the device path. Only the in-place
+gather-pipe append is skipped, and a stack frame can never be the pipe.
+
+### Validation (Windows)
+
+1. `$RELEASE --stack-r11-stores`. The module builds. `grep -c "store_stack"
+   functions_*.cpp` grows by about the number of `_savegpr` sites times
+   their register counts.
+2. Routes as above. A/B on the 32 MB CCD steady scene, 3 rounds paired.

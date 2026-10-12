@@ -172,3 +172,22 @@ a module built without the new flag never names the new helpers.
      combination, each through eight state changes. In all of them the
      snapshot helpers return the same counted value, advance the counter the
      same way and give the same transfer test as the service-table helpers.
+3. `--flat-view-only` (work item 1.3)
+   - `runtime/include/galaxy/native_api.h`:
+     - Line 8713: `GALAXY_FLAT_VIEW_ONLY_ACTIVE` (fastmem plus the
+       module's `GALAXY_FLAT_VIEW_ONLY`, unless
+       `GALAXY_FASTMEM_KEEP_NULL_FALLBACK`) and `assumed_flat_view` (8726).
+     - `lean_guest_span` (8736) and `cstring::view` (10147) use the assumed
+       view in that mode. Every other build keeps the checked arms unchanged.
+   - `runtime/include/galaxy/native_fast_paths.h` line 228: new
+     `fast::zero_line` for `dcbz`. A line in a RAM alias goes through the
+     flat view; any other line goes to `guest_zero`.
+   - `runtime/src/native_flat_view_only_tests.cpp` (new) and
+     `CMakeLists.txt` lines 891-894, 1115, 1164: the
+     `galaxy_native_flat_view_only_tests` target.
+   - No runtime code changes. The module already exports
+     `galaxy_module_memory_flags` (requires the flat view) in every fastmem
+     build, and that is the guarantee this mode relies on.
+4. `--stack-r11-stores` (gap item 1: r1/r11 accesses skip the gather-pipe
+   test): no runtime change. It uses the existing `fast::store_stack`.
+
