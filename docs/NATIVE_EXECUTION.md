@@ -568,7 +568,7 @@ Cache size: the same module and route with the process pinned to one CCD
 of the 9950X3D, 2 rounds each: 96 MB L3 CCD 15.5/17.3 %, 32 MB L3 CCD
 (higher clock) 23.9/24.4 % of a core. The simulation thread needs about
 1.5 times the CPU time with a third of the L3, so laptop CPUs (24 MB on
-the Core Ultra 9 185H, 3 MB on the i7-6500U) are dominated by the
+the Core Ultra 9 185H, 4 MB on the i7-6500U) are dominated by the
 translated code's footprint; A/B runs from here on are pinned to the
 32 MB CCD (`tools/ab-mod.ps1 -Affinity 4294901760`).
 
