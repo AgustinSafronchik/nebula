@@ -896,3 +896,131 @@ gate load/test pairs, the `pc` store and `call *site_function(%rip)`.
    `[direct-dispatch] withheld=` unchanged and the mouse/movie markers still
    fire).
 4. A/B on the 32 MB CCD.
+
+---
+
+## Measurement loop and asm table
+
+Run `tools/perf/asm_probe.py`. It lowers the probe corpus
+(`crates/nebula-recomp-core/src/asm_probe.rs`, via `nebula-recomp
+asm-probe`) once per configuration and produces two counts:
+
+- **Static.** Each shard is compiled with `zig c++ -target
+  x86_64-windows-gnu -O2 -mavx2 -mfma -mmovbe` and the module's codegen
+  flags, with local stubs in `tools/perf/asm_probe/stubs/`.
+- **Dynamic.** A callgrind run of `tools/perf/asm_probe/asm_probe_driver.cpp`,
+  linked with the exact float library (`ppc_float.cpp` over SoftFloat).
+
+MSVC headers were not reachable from this machine, so the Win64 target is
+the mingw one, which has the same calling convention as clang-cl.
+
+Table 1, item 1 against item 1 plus 2.1 (21 measured probes, before the float
+probes were added). Columns: static count, static per guest instruction,
+dynamic count, dynamic per executed instruction.
+
+| probe | class | guest | executed | item1 static | item1 static/guest | item1 dynamic | item1 dynamic/executed | abi static | abi static/guest | abi dynamic | abi dynamic/executed | abifloat static | abifloat static/guest | abifloat dynamic | abifloat dynamic/executed |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| callee_leaf | callee | 2 | 2 | 8 | 4.0 | 8 | 3.8 | 8 | 4.0 | 8 | 3.8 | 8 | 4.0 | 8 | 3.8 |
+| callee_frame | callee | 8 | 8 | 31 | 3.9 | 26 | 3.2 | 30 | 3.8 | 24 | 2.9 | 30 | 3.8 | 24 | 2.9 |
+| int_alu | integer ALU | 11 | 11 | 53 | 4.8 | 46 | 4.2 | 31 | 2.8 | 28 | 2.5 | 31 | 2.8 | 28 | 2.5 |
+| int_load | integer load | 9 | 9 | 42 | 4.7 | 35 | 3.9 | 11 | 1.2 | 8 | 0.9 | 11 | 1.2 | 8 | 0.9 |
+| int_store | integer store | 7 | 7 | 363 | 51.9 | 62 | 8.9 | 363 | 51.9 | 62 | 8.9 | 363 | 51.9 | 62 | 8.9 |
+| stack_frame | stack load/store | 12 | 12 | 22 | 1.8 | 17 | 1.4 | 22 | 1.8 | 17 | 1.4 | 22 | 1.8 | 17 | 1.4 |
+| float_single | float single | 9 | 9 | 146 | 16.2 | 58 | 6.4 | 146 | 16.2 | 58 | 6.4 | 152 | 16.9 | 52 | 5.8 |
+| float_double | float double | 7 | 7 | 79 | 11.3 | 36 | 5.1 | 79 | 11.3 | 36 | 5.1 | 84 | 12.0 | 35 | 5.0 |
+| paired | paired single | 8 | 8 | 315 | 39.4 | 110 | 13.8 | 315 | 39.4 | 110 | 13.8 | 261 | 32.6 | 98 | 12.2 |
+| float_compare | float compare/convert | 7 | 6 | 137 | 19.6 | 69 | 11.5 | 137 | 19.6 | 69 | 11.5 | 135 | 19.3 | 69 | 11.5 |
+| compare_branch | compare and branch | 9 | 7 | 14 | 1.6 | 11 | 1.6 | 14 | 1.6 | 11 | 1.6 | 14 | 1.6 | 11 | 1.6 |
+| record_forms | record forms | 7 | 6 | 15 | 2.1 | 12 | 2.0 | 12 | 1.7 | 9 | 1.5 | 12 | 1.7 | 9 | 1.5 |
+| carry | carry chain | 8 | 8 | 42 | 5.2 | 35 | 4.4 | 35 | 4.4 | 28 | 3.5 | 35 | 4.4 | 28 | 3.5 |
+| cr_logic | CR logic | 3 | 3 | 8 | 2.7 | 5 | 1.7 | 8 | 2.7 | 5 | 1.7 | 8 | 2.7 | 5 | 1.7 |
+| leaf_accessor | entry/exit | 2 | 2 | 9 | 4.5 | 6 | 3.0 | 9 | 4.5 | 6 | 3.0 | 9 | 4.5 | 6 | 3.0 |
+| call_direct | direct call | 14 | 14 | 175 | 12.5 | 96 | 6.9 | 172 | 12.3 | 86 | 6.1 | 172 | 12.3 | 86 | 6.1 |
+| call_leaf | direct call | 8 | 8 | 31 | 3.9 | 26 | 3.2 | 30 | 3.8 | 24 | 2.9 | 30 | 3.8 | 24 | 2.9 |
+| call_virtual | virtual call | 15 | 15 | 162 | 10.8 | 98 | 6.6 | 158 | 10.5 | 90 | 6.0 | 158 | 10.5 | 90 | 6.0 |
+| loop_sum | counted loop | 8 | 68 | 119 | 14.9 | 146 | 2.1 | 115 | 14.4 | 143 | 2.1 | 115 | 14.4 | 143 | 2.1 |
+| savegpr_frame | register save helpers | 14 | 14 | 49 | 3.5 | 42 | 3.0 | 47 | 3.4 | 40 | 2.9 | 47 | 3.4 | 40 | 2.9 |
+| stmw_frame | load/store multiple | 8 | 8 | 37 | 4.6 | 30 | 3.8 | 37 | 4.6 | 30 | 3.8 | 37 | 4.6 | 30 | 3.8 |
+| stmw_low | load/store multiple | 8 | 8 | 59 | 7.4 | 50 | 6.2 | 59 | 7.4 | 50 | 6.2 | 59 | 7.4 | 50 | 6.2 |
+| dcbz_line | cache line zero | 5 | 5 | 66 | 13.2 | 44 | 8.8 | 58 | 11.6 | 38 | 7.6 | 58 | 11.6 | 38 | 7.6 |
+| **all probes** |  | 179 | 235 | 1943 | 10.9 | 1034 | 4.4 | 1858 | 10.4 | 948 | 4.0 | 1813 | 10.1 | 929 | 4.0 |
+
+Baseline: item1. Configurations: item1=release,hw-float-conversions,checkpoint-globals,flat-view-only,stack-r11-stores,assume-paired-singles; abi=release,hw-float-conversions,checkpoint-globals,flat-view-only,stack-r11-stores,assume-paired-singles,abi-call-sync,abi-exit-sync; abifloat=release,hw-float-conversions,checkpoint-globals,flat-view-only,stack-r11-stores,assume-paired-singles,abi-call-sync,abi-exit-sync,guest-resident-float
+
+Table 2, the float items (24 measured probes; 2.1 in every column):
+
+| probe | class | guest | executed | abi static | abi static/guest | abi dynamic | abi dynamic/executed | grf static | grf static/guest | grf dynamic | grf dynamic/executed | single static | single static/guest | single dynamic | single dynamic/executed | forms static | forms static/guest | forms dynamic | forms dynamic/executed |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| callee_leaf | callee | 2 | 2 | 8 | 4.0 | 8 | 3.8 | 8 | 4.0 | 8 | 3.8 | 8 | 4.0 | 8 | 3.8 | 8 | 4.0 | 8 | 3.8 |
+| callee_frame | callee | 8 | 8 | 30 | 3.8 | 24 | 2.9 | 30 | 3.8 | 24 | 2.9 | 30 | 3.8 | 24 | 2.9 | 30 | 3.8 | 24 | 2.9 |
+| int_alu | integer ALU | 11 | 11 | 31 | 2.8 | 28 | 2.5 | 31 | 2.8 | 28 | 2.5 | 31 | 2.8 | 28 | 2.5 | 31 | 2.8 | 28 | 2.5 |
+| int_load | integer load | 9 | 9 | 11 | 1.2 | 8 | 0.9 | 11 | 1.2 | 8 | 0.9 | 11 | 1.2 | 8 | 0.9 | 11 | 1.2 | 8 | 0.9 |
+| int_store | integer store | 7 | 7 | 363 | 51.9 | 62 | 8.9 | 363 | 51.9 | 62 | 8.9 | 363 | 51.9 | 62 | 8.9 | 363 | 51.9 | 62 | 8.9 |
+| stack_frame | stack load/store | 12 | 12 | 22 | 1.8 | 17 | 1.4 | 22 | 1.8 | 17 | 1.4 | 22 | 1.8 | 17 | 1.4 | 22 | 1.8 | 17 | 1.4 |
+| float_single | float single | 9 | 9 | 146 | 16.2 | 58 | 6.4 | 152 | 16.9 | 52 | 5.8 | 146 | 16.2 | 46 | 5.1 | 146 | 16.2 | 46 | 5.1 |
+| float_double | float double | 7 | 7 | 79 | 11.3 | 36 | 5.1 | 84 | 12.0 | 35 | 5.0 | 84 | 12.0 | 35 | 5.0 | 84 | 12.0 | 35 | 5.0 |
+| paired | paired single | 8 | 8 | 315 | 39.4 | 110 | 13.8 | 261 | 32.6 | 98 | 12.2 | 259 | 32.4 | 96 | 12.0 | 259 | 32.4 | 96 | 12.0 |
+| float_compare | float compare/convert | 7 | 6 | 137 | 19.6 | 69 | 11.5 | 135 | 19.3 | 69 | 11.5 | 135 | 19.3 | 69 | 11.5 | 106 | 15.1 | 57 | 9.5 |
+| float_loop | float loop | 10 | 25 | 196 | 19.6 | 124 | 5.0 | 209 | 20.9 | 109 | 4.4 | 208 | 20.8 | 97 | 3.9 | 208 | 20.8 | 97 | 3.9 |
+| paired_mtx | paired matrix | 9 | 9 | 337 | 37.4 | 130 | 14.4 | 375 | 41.7 | 115 | 12.8 | 375 | 41.7 | 115 | 12.8 | 375 | 41.7 | 115 | 12.8 |
+| float_select | float select/estimate | 9 | 8 | 217 | 24.1 | 367 | 45.9 | 227 | 25.2 | 380 | 47.5 | 227 | 25.2 | 380 | 47.5 | 152 | 16.9 | 65 | 8.1 |
+| compare_branch | compare and branch | 9 | 7 | 14 | 1.6 | 11 | 1.6 | 14 | 1.6 | 11 | 1.6 | 14 | 1.6 | 11 | 1.6 | 14 | 1.6 | 11 | 1.6 |
+| record_forms | record forms | 7 | 6 | 12 | 1.7 | 9 | 1.5 | 12 | 1.7 | 9 | 1.5 | 12 | 1.7 | 9 | 1.5 | 12 | 1.7 | 9 | 1.5 |
+| carry | carry chain | 8 | 8 | 35 | 4.4 | 28 | 3.5 | 35 | 4.4 | 28 | 3.5 | 35 | 4.4 | 28 | 3.5 | 35 | 4.4 | 28 | 3.5 |
+| cr_logic | CR logic | 3 | 3 | 8 | 2.7 | 5 | 1.7 | 8 | 2.7 | 5 | 1.7 | 8 | 2.7 | 5 | 1.7 | 8 | 2.7 | 5 | 1.7 |
+| leaf_accessor | entry/exit | 2 | 2 | 9 | 4.5 | 6 | 3.0 | 9 | 4.5 | 6 | 3.0 | 9 | 4.5 | 6 | 3.0 | 9 | 4.5 | 6 | 3.0 |
+| call_direct | direct call | 14 | 14 | 172 | 12.3 | 86 | 6.1 | 172 | 12.3 | 86 | 6.1 | 172 | 12.3 | 86 | 6.1 | 172 | 12.3 | 86 | 6.1 |
+| call_leaf | direct call | 8 | 8 | 30 | 3.8 | 24 | 2.9 | 30 | 3.8 | 24 | 2.9 | 30 | 3.8 | 24 | 2.9 | 30 | 3.8 | 24 | 2.9 |
+| call_virtual | virtual call | 15 | 15 | 158 | 10.5 | 90 | 6.0 | 158 | 10.5 | 90 | 6.0 | 158 | 10.5 | 90 | 6.0 | 158 | 10.5 | 90 | 6.0 |
+| loop_sum | counted loop | 8 | 68 | 115 | 14.4 | 143 | 2.1 | 115 | 14.4 | 143 | 2.1 | 115 | 14.4 | 143 | 2.1 | 115 | 14.4 | 143 | 2.1 |
+| savegpr_frame | register save helpers | 14 | 14 | 47 | 3.4 | 40 | 2.9 | 47 | 3.4 | 40 | 2.9 | 47 | 3.4 | 40 | 2.9 | 47 | 3.4 | 40 | 2.9 |
+| stmw_frame | load/store multiple | 8 | 8 | 37 | 4.6 | 30 | 3.8 | 37 | 4.6 | 30 | 3.8 | 37 | 4.6 | 30 | 3.8 | 37 | 4.6 | 30 | 3.8 |
+| stmw_low | load/store multiple | 8 | 8 | 59 | 7.4 | 50 | 6.2 | 59 | 7.4 | 50 | 6.2 | 59 | 7.4 | 50 | 6.2 | 59 | 7.4 | 50 | 6.2 |
+| dcbz_line | cache line zero | 5 | 5 | 58 | 11.6 | 38 | 7.6 | 58 | 11.6 | 38 | 7.6 | 58 | 11.6 | 38 | 7.6 | 58 | 11.6 | 38 | 7.6 |
+| **all probes** |  | 207 | 277 | 2608 | 12.6 | 1569 | 5.7 | 2624 | 12.7 | 1533 | 5.5 | 2615 | 12.6 | 1513 | 5.5 | 2511 | 12.1 | 1186 | 4.3 |
+
+Baseline: abi. Configurations: abi=release,hw-float-conversions,checkpoint-globals,flat-view-only,stack-r11-stores,assume-paired-singles,abi-call-sync,abi-exit-sync; grf=release,hw-float-conversions,checkpoint-globals,flat-view-only,stack-r11-stores,assume-paired-singles,abi-call-sync,abi-exit-sync,guest-resident-float; single=release,hw-float-conversions,checkpoint-globals,flat-view-only,stack-r11-stores,assume-paired-singles,abi-call-sync,abi-exit-sync,guest-resident-float,single-float-arithmetic; forms=release,hw-float-conversions,checkpoint-globals,flat-view-only,stack-r11-stores,assume-paired-singles,abi-call-sync,abi-exit-sync,guest-resident-float,single-float-arithmetic,fast-float-forms
+
+## Status at the end of this session
+
+Done on this branch, each behind its own flag, default off, with tests in
+both flag states:
+
+- `--hw-float-conversions`
+- `--checkpoint-globals` (runtime refresh sites still to write; see
+  TRANSLATOR_CPU_TASK.md, Runtime changes 2)
+- `--flat-view-only`
+- `--stack-r11-stores`
+- `--assume-paired-singles` (now also drops `require_paired_single_mode`)
+- `--abi-call-sync` and `--abi-exit-sync`, with `abi_contract.json`
+- `--single-float-arithmetic`
+- `--fast-float-forms`
+- `--bctrl-site-cache`
+
+Also added: the dataflow analysis (`ppc_dataflow.rs`), the asm probe loop,
+and the generated ledger (docs/PERF_LEDGER.md).
+
+Not done (open, in ledger order of the requested translator list):
+
+- Dead condition-code and carry elimination. The analysis exists
+  (`ppc_dataflow::dead_flag_writes`); the lowering is not written.
+- Checkpoint-free generation (work item 3, ledger T-CALLRET-CKPT and
+  T-CONTINUATION-STUBS).
+- Tiny-leaf inlining across shards (T-LEAF-CALLS).
+- Hot/cold shard splitting, with the store slow path out of line (measured
+  -29 % static code on the probes).
+- Every runtime patch candidate. Display-list validation by flush tracking,
+  per-frame allocation pools, constants and descriptor tables rebuilt only
+  on change, GX draw-done/draw-sync as host calls, cached clock reads, a
+  one-counter checkpoint body, idle-wait precision and the gather-pipe
+  drain are designed in the ledger but not patched.
+- The `--checkpoint-globals` runtime refresh sites.
+
+Not verified:
+
+- The ledger's verification and synthesis stages did not run, so its
+  entries are survey output.
+- An adversarial review of `--abi-call-sync`/`--abi-exit-sync` was started
+  and did not report.
+- Nothing was run on Windows. Every flag needs the validation steps in its
+  section.
