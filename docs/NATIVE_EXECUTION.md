@@ -586,6 +586,20 @@ Gameplay route smoke (unpinned): 59.95 new frames/s, no repeats,
 simulation thread 14.1 %; Home menu route: 403 flag returns, no failures.
 Steady scene A/B (Comet Observatory, no input, simulation thread over 60 to 88 s, one logical CPU per core of the 32 MB CCD, 4 rounds): generation 20 29.7/28.0/28.6/24.5 % to generation 21 26.4/25.9/25.1/26.7 % (median 28.3 to 26.2, lower in 3 of 4 pairs). Gameplay-route A/B on the 32 MB CCD spread 16.8 to 23.7 % for one module (the route diverges after about 35 s), so it is not used for these decisions; `tools/ab-window.ps1` runs the steady scene.
 
+Generation 23 (the Native22 package module):
+
+| Item | Change | Measured |
+| --- | --- | --- |
+| Float helpers are not GPR sync points | Without float residency, the fast float helpers (`fast::load_fpr_single`, `store_fpr_single`, `psq_load`, `psq_store`, `scalar_*`, `paired_*`, `fctiwz`, `ppc_commit_scalar_result`) only touch FPR/PS1, FPSCR, GQR, HID2 and CR through `context`, so the residency pass no longer stores every written GPR local before them and reloads every used one after them. In checkArrow (0x801839CC) each FP instruction carried about 20 stores and 25 reloads | generated source 417 to 372 MB; about 96,000 sites in the first 1,000 shards |
+| Record fusion | A CR0 record form followed by `bc` on CR0[LT/GT/EQ], under the compare-fusion rules, drops its `update_cr0` and the branch tests the recorded register | 3,681 of 4,752 `update_cr0` sites |
+| Lean bodies | The small TVec3/TUtil/GD bodies are force-inlined at their call sites; in a fastmem module the lean bodies reach RAM through the flat view as translated code does; the GD writers use plain view access instead of the checked, notifying accessors (2 notifications and 4 trace gates per J3DGDWrite_u32) | `bench/diff_tvec3.cpp` and `bench/diff_strings.cpp` against generation 21: 0 mismatches, 0 contract violations |
+
+Gameplay route (unpinned, 130 s): 60.00 new frames/s, no repeats, no VI
+interval above 17.4 ms, simulation thread 14.5 % (a first run hit one
+275 ms first-use pipeline compile on a fresh shader cache; the repeat did
+not). Home menu route: 404 flag returns, no failures, 60.0 new frames/s,
+no repeats, simulation thread 17.7 % (Native21 19.8 %).
+
 ## Known simulation-thread stalls (from the 9950X3D A/B telemetry)
 
 - (Resolved, F9 pointer) Keyboard/mouse pointer mode waited for the current
