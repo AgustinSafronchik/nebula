@@ -821,3 +821,78 @@ Dynamic counts are from callgrind.
 4. Routes and frame dumps: gameplay (camera, Mario physics, gravity fields),
    Home menu, prologue movie, save. Visual comparison, not bit comparison.
 5. A/B each of the three flags alone and together, 3 rounds, 32 MB CCD.
+
+---
+
+## 2.3 Direct-mapped bctrl with a per-site cache (`--bctrl-site-cache`)
+
+### Design
+
+`bctrl`/`bclrl` (and a non-link `bctr`) with direct dispatch went through
+`fast::call_guest_indirect` on every call, about 29 x86 instructions before
+the call (ledger T-BCTRL-DISPATCH):
+
+- services null test;
+- loads of `direct_dispatch`, `direct_dispatch_base` and
+  `direct_dispatch_count`;
+- range and alignment tests;
+- a load from the dispatch table, which holds one 8-byte entry per guest
+  word over the whole text (about 10.6 MB, so the line is cold on a 4 MB L3);
+- the null test, the two gate loads and tests (pending event mask,
+  external-dispatch suspension), and the `context->pc` store.
+
+The runtime builds the table once at module load
+(`build_direct_dispatch_table`) and never changes an entry. With the flag,
+each site keeps two more statics, the last published target and its entry
+(`fast::call_guest_indirect_site`):
+
+- **Hit.** A compare against the site's cached target, the two gate tests,
+  the `pc` store and the call. No services-table loads, no dispatch-table
+  access.
+- **Miss.** The lookup as before, with `rotr(target - base, 2) < count/4` as
+  one combined range and alignment test. A non-null entry is cached
+  (function first, then target, with a compiler fence).
+- **Gate closed, or entry withheld.** The cached service boundary, exactly
+  as before. A withheld entry is never cached.
+
+Virtual call sites are mostly monomorphic in SMG (nerve executors, actor
+movement); a polymorphic site behaves as before plus one compare.
+
+### Emitted code
+
+```
+static std::uint32_t cached_target_80714020 = 0u;
+static galaxy::NativeGameFunction cached_function_80714020 = nullptr;
+static std::uint32_t site_target_80714020 = galaxy::fast::kNoIndirectSite;
+static galaxy::NativeGameFunction site_function_80714020 = nullptr;
+galaxy::fast::call_guest_indirect_site(services, branch_target, &cached_target_80714020, &cached_function_80714020, &site_target_80714020, &site_function_80714020, context, memory, 0x80714020u);
+```
+
+### Measured
+
+call_virtual (prologue, two loads, bctrl, epilogue) on top of item 1 and
+2.1: dynamic 90 to 77 x86 instructions per call, static 158 to 176 (the
+miss path). The hit path compiles to `cmp site_target(%rip)`, `jne`, two
+gate load/test pairs, the `pc` store and `call *site_function(%rip)`.
+
+### Risks
+
+- If the runtime ever rewrites a direct-dispatch entry after load, for
+  example to withhold a target when a hook is enabled at run time, a
+  site-cached module would keep calling the old entry. Today the table is
+  built once (diagnostics that need the boundary disable direct dispatch
+  entirely at load).
+- The statics are per site, written only on the simulation thread. Another
+  host thread running the same translated function would race benignly: the
+  function pointer is written before the target.
+
+### Validation (Windows)
+
+1. `ctest -R native_bctrl_site_cache`.
+2. `$RELEASE --bctrl-site-cache`: `grep -c call_guest_indirect_site
+   functions_*.cpp` equals the previous `call_guest_indirect(` count.
+3. Routes: gameplay (actors, nerves), Home menu (its own dispatch), mouse
+   and FileSelect (withheld targets must still cross the boundary:
+   `[direct-dispatch] withheld=` unchanged and the mouse/movie markers still
+   fire).
+4. A/B on the 32 MB CCD.

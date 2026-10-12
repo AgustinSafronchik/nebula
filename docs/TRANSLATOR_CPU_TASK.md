@@ -255,4 +255,19 @@ a module built without the new flag never names the new helpers.
      CR field only.
    - The generated code names these helpers only under the flag.
    - No runtime code changes. Tested by the same target as item 8.
+10. `--bctrl-site-cache` (work item: direct-mapped bctrl dispatch)
+    - `runtime/include/galaxy/native_fast_paths.h`:
+      - line 2074: `kNoIndirectSite` and `direct_dispatch_open`;
+      - line 2081: `call_guest_indirect_site`. It is `call_guest_indirect`
+        plus a per-site cache of the last published direct entry, with a
+        rotate that folds the alignment test into the range compare.
+    - `runtime/src/native_bctrl_site_cache_tests.cpp` (new) and
+      `CMakeLists.txt` line 903 onward: the target
+      `galaxy_native_bctrl_site_cache_tests` (`ctest -R
+      native_bctrl_site_cache`).
+    - No runtime code changes. The cache relies on the direct-dispatch table
+      never changing after `build_direct_dispatch_table`
+      (`runtime/src/native_runtime.cpp` around line 15869). If the runtime
+      ever republishes entries, it must stop advertising the table to
+      site-cached modules.
 
