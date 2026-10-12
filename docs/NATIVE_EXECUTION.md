@@ -600,6 +600,32 @@ interval above 17.4 ms, simulation thread 14.5 % (a first run hit one
 not). Home menu route: 404 flag returns, no failures, 60.0 new frames/s,
 no repeats, simulation thread 17.7 % (Native21 19.8 %).
 
+## Native23 session 2026-10-11: stutter sources, generation 25
+
+Laptop recordings (Core Ultra 9 185H, Arc iGPU, Native22): 18 VI intervals
+above 25 ms in 930 s, each a long render-thread chunk that filled the
+two-deep render queue. Slow chunks broke down into texture flushes (up to
+106 ms), vertex loads (up to 88 ms), GPU frame-slot waits and `Present`.
+
+| Item | Change | Measured (9950X3D, RTX 5090, gameplay route, 1280x720 at 2x) |
+| --- | --- | --- |
+| Placed textures | Decoded textures and EFB-copy targets are sub-allocated from 64 MB / 128 MB heaps (`PlacedTextureAllocator`); a range returns to its heap when D3D12 destroys the resource (private-data owner), so textures keep their fence-deferred release | creation per texture: committed 215-265 us, placed 5-9 us (`bench/placed_bench.cpp`, RTX 5090 and Radeon iGPU); texture-miss resource time over the route 90.9 to 2.4 ms |
+| Worker decodes | First-use texture decodes run on the decode pool in live-memory mode too (hardware threads / 2, 2 to 8 workers) | Comet Observatory entry chunk 76 to 30.7 ms instrumented, 13.8 ms with only the timeline on; texture flush 46.5 to 2.4 ms, decode join 0 |
+| First-use allocations | The 64 MB resident decoded-vertex buffer and the EFB-peek / pointer-depth readback resources are created at startup | removes a 10 ms render stall at the first resident draw |
+| Prefetch | The game module and Home Button sidecar images are read in by a background-priority thread after loading; the disc worker prefetches each request's span before copying it from the mapped `game.pak` | not measurable on a warm desktop file cache |
+| Keys | Held keys come from WM_KEYDOWN/WM_KEYUP (cleared on focus loss) instead of 32 `GetAsyncKeyState` calls per input poll | 185H: that syscall was 1.8 % of simulation-thread samples, polls took 79-161 us |
+| Display-list cache | New entries take a free slot or a sampled LRU victim instead of scanning 2048 slots; `fifo-call-dl-miss-parse-us` / `fifo-call-dl-store-us` counters | store 0.7 ms of the Observatory entry's first-sight lists |
+
+Generation 25: `fast::flat_base` tells the compiler the flat view is
+non-null in a fastmem module (which now exports
+`galaxy_module_memory_flags` = requires flat view; the runtime refuses to
+start it otherwise), removing the null-view fallback the compiler duplicated
+around memory accesses; stores addressed from r1 skip the gather-pipe test
+(`fast::store_stack`); `lfs` writes ps1 without the HID2 test in fast-float
+modules. Module 208.9 to 147.6 MB; one shard's .text 359,055 to 323,560
+bytes. Steady scene A/B (Comet Observatory, simulation thread over 60 to
+88 s, 3 rounds): all cores 18.1/14.1/15.3 to 14.4/14.3/13.6 %; 32 MB CCD, one logical CPU per core 27.5/28.4/28.6 to 25.8/25.3/23.9 % (lower in every pair).
+
 ## Known simulation-thread stalls (from the 9950X3D A/B telemetry)
 
 - (Resolved, F9 pointer) Keyboard/mouse pointer mode waited for the current
@@ -617,7 +643,7 @@ no repeats, simulation thread 17.7 % (Native21 19.8 %).
 | F6 (checkpoints) | Branch and call-return checkpoints remain: counter, watermark and event-mask loads through the services table at every backward branch and call return |
 | F8 | Superseded: the DSP no longer runs by default (host JAudio mixer, Native14) |
 | F10 | PE tokens at FIFO consumption instead of GPU fence |
-| F12, F14 | Compact per-layout vertex stride; non-blocking pipeline misses (needs a real uber pipeline). The remaining texture spikes are resource creation, not decode; placed heaps or recycled resources are the fix |
+| F12, F14 | Compact per-layout vertex stride; non-blocking pipeline misses (needs a real uber pipeline). Texture resource creation: placed heaps (Native23) |
 | F16 | Working-set investigation (2.8 to 5.4 GB observed) |
 | F17, F18 | Present phase lock to vblank; compile-time removal of remaining runtime trace gates |
 | F20 | Flag returns shipped (Native12). Guest threads as fibers remain the next step of the SDK replacement plan |
