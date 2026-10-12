@@ -626,6 +626,55 @@ modules. Module 208.9 to 147.6 MB; one shard's .text 359,055 to 323,560
 bytes. Steady scene A/B (Comet Observatory, simulation thread over 60 to
 88 s, 3 rounds): all cores 18.1/14.1/15.3 to 14.4/14.3/13.6 %; 32 MB CCD, one logical CPU per core 27.5/28.4/28.6 to 25.8/25.3/23.9 % (lower in every pair).
 
+## Native24 session 2026-10-11: volume categories, controller access to settings
+
+Volume categories (master, music, SFX, voice, ambience, cutscene) on the
+default host JAudio mixer path:
+
+- Each audio frame, every DSP channel's owner is resolved from JAudio's own
+  structures, each link checked: `JASDSPChannel::sDspChannels` (0x806A2BD0)
+  -> JASChannel (whose `mDspCh` points back) -> its track's TChannelMgr or its
+  JASAramStream -> the owning JAISe / JAISeq / JAIStream's `mSoundID`. The
+  sound ID's section and category pick the bus (BGM/stream -> music; SE
+  categories: PLAYER/BOSS/ENEMY/SUPPORTER_VOICE -> voice, ATMOSPHERE ->
+  ambience, DEMO -> cutscene, others -> SFX). Field offsets from the Petari
+  layouts (docs/PROVENANCE.md). The previous chain read one link too deep and
+  never resolved an owner, so every channel fell back to its sample format.
+- The host mixer applies each channel's bus gain after its filters, ramping a
+  change over one 80-sample subframe; a channel taken over by an owner on
+  another bus starts at that bus's gain (no ramp from the previous owner).
+- Master is applied once to the final output (the movie player mixes outside
+  the DSP channels). The movie player's attenuation table (VolumeTable,
+  0x805C5D08, verified against its known values before use) is rescaled for
+  the cutscene volume.
+- Settings: overlay AUDIO page (six rows), launcher Audio tab, keys
+  `audio_*_gain` in runtime_settings.ini, `GALAXY_AUDIO_*_GAIN`.
+
+Measured (gameplay route, WAV of the final output, one run per setting):
+
+| Setting | Result |
+| --- | --- |
+| Master 0.5 | -6.0 dB in every 10 s window, peak -1.4 to -7.4 dBFS |
+| Master 0 | digital silence from the first sample |
+| Only music | title music identical to the full mix; no SFX or voices |
+| Only SFX | title period silent; menu and movement sounds present |
+| Only voice | Mario's and the Lumas' voices only, first at the first jump (75 % of samples zero) |
+| Only ambience | the route's one ATMOSPHERE sound (0x6002D) |
+| Owner routes | BGM sequence 0x1000038 and streams 0x2000001/1E/26 -> music; SE 0x1xxxx/0xAxxxx -> voice; 0x2xxxx, 0x5xxxx, 0xBxxxx, system -> SFX |
+
+Cutscene: no DEMO sounds or movies on this route; the movie table check passed
+in every run that lowered the cutscene volume (the movie path itself is not yet
+measured).
+
+Settings overlay from a controller: View+Menu (Back+Start) toggles it; D-pad
+or left stick move and change, `A` changes, LB/RB page, `B` or Menu close.
+While it is open the game sees a neutral pad, and buttons held across a toggle
+stay hidden from the game until released. Measured in controller mode with a
+600 ms chord: overlay shown, game not paused; a plain 600 ms Menu press later
+in the same run paused the game. A replayed controller route (overlay open,
+RB x3, Down, 20 x Left/Right on MUSIC then SFX) logged every step once
+(`[settings]` lines). A hint names F1 and View+Menu for the first 8 seconds.
+
 ## Known simulation-thread stalls (from the 9950X3D A/B telemetry)
 
 - (Resolved, F9 pointer) Keyboard/mouse pointer mode waited for the current
