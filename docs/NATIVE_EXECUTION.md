@@ -572,6 +572,20 @@ the Core Ultra 9 185H, 3 MB on the i7-6500U) are dominated by the
 translated code's footprint; A/B runs from here on are pinned to the
 32 MB CCD (`tools/ab-mod.ps1 -Affinity 4294901760`).
 
+Code size and branch lowering (generation 21):
+
+| Item | Change | Measured |
+| --- | --- | --- |
+| Checked store path | Every guest store inlined its checked device path (region lookup, dirty tracking, notification), and `wgpipe_append` was `noexcept` around the gather-pipe flush callback, so each store site also carried a `__std_terminate` funclet, EH state stores and a frame pointer. The checked path is one out-of-line copy per width (`checked_store_slow`); the gather-pipe append stays inline. The indirect-call boundary (`call_guest_cached` and its trace gates) is out of line too | funclets 198,732 to 317, .xdata 12.9 MB to 55 KB |
+| Leaf calls | A linked call to a translated leaf with no checkpoint of its own (`is_checkpoint_free_leaf`: forward branches and returns only; no call, indirect branch, sc, trap, rfi, mtmsr or SPR write other than XER/LR/CTR/GQR) has no call-return checkpoint: it can neither raise a transfer nor delay an event | call-return sites 304,463 to 283,457 |
+| Shared cold block | Each call-return checkpoint's cold half (stores of every written register, the policy call, reloads) was emitted at every site and again in its continuation stub. A function now has one shared block; a site stores its index and jumps there, and the block jumps back to the site's resume label | shard 0386 what-if: the call-return machinery was half of its code |
+| Compare fusion | An integer compare (any CR field) followed by `bc` on one of its LT/GT/EQ bits, where nothing else enters the branch and the field is dead on both successors (`cr_field_dead_from`: a bounded walk; a whole-field write kills it; calls kill CR0 and CR5-CR7, returns everything but CR2-CR4; anything it cannot follow counts as a read), lowers to one C++ condition on the operands; the CR write is gone | 54,521 of 67,523 compares fused |
+
+Generated source 552 to 417 MB, module 377 to 203 MB (.text 194 MB).
+Gameplay route smoke (unpinned): 59.95 new frames/s, no repeats,
+simulation thread 14.1 %; Home menu route: 403 flag returns, no failures.
+Steady scene A/B (Comet Observatory, no input, simulation thread over 60 to 88 s, one logical CPU per core of the 32 MB CCD, 4 rounds): generation 20 29.7/28.0/28.6/24.5 % to generation 21 26.4/25.9/25.1/26.7 % (median 28.3 to 26.2, lower in 3 of 4 pairs). Gameplay-route A/B on the 32 MB CCD spread 16.8 to 23.7 % for one module (the route diverges after about 35 s), so it is not used for these decisions; `tools/ab-window.ps1` runs the steady scene.
+
 ## Known simulation-thread stalls (from the 9950X3D A/B telemetry)
 
 - (Resolved, F9 pointer) Keyboard/mouse pointer mode waited for the current
