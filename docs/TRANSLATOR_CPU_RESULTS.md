@@ -682,3 +682,142 @@ symptom.
 6. A/B `ab-affinity` on the 32 MB CCD, 3 rounds: simulation-thread share,
    module and `.text` size. Run it with and without
    `--experimental-guest-resident-float`.
+
+---
+
+## 2.2 Float arithmetic on typed locals (`--single-float-arithmetic`, `--fast-float-forms`)
+
+### Design
+
+"Typed locals" combines three flags. Each is A/B-testable alone.
+
+1. **Locals.** `--experimental-guest-resident-float` already keeps the
+   FPR/PS1 file in host locals (`fpr[32]`/`ps1[32]` arrays with constant
+   indices, which clang promotes to registers). It measured slower on its own
+   (docs/NATIVE_EXECUTION.md:458): every call and return synchronized every
+   used float register. Under `--abi-call-sync --abi-exit-sync` (2.1) a call
+   synchronizes only f1-f8 and f14-f31 and a return stores only f1/f2 and
+   f14-f31. Float residency now pays, and all the numbers below include it.
+2. **Binary32 arithmetic** (`--single-float-arithmetic`; `functions.h`
+   defines `GALAXY_SINGLE_FLOAT_ARITHMETIC`). The fast paths of the single
+   and paired-single forms round their operands to binary32 and compute in
+   binary32:
+   - `mulss`/`addss`/`vfmadd*ss` for fadds/fsubs/fmuls/fdivs and the fmadds
+     family;
+   - `mulps`/`addps`/`vfmadd*ps` on two lanes for ps_add/ps_sub/ps_mul/
+     ps_muls*/ps_div and the ps_madd family;
+   - binary32 for ps_sum0/ps_sum1.
+
+   The Gekko computes in binary64, rounds the multiplier of a single multiply
+   to 25 bits, and rounds the result to binary32. For binary32 operands,
+   which is every operand produced by lfs, psq_l and single arithmetic, the
+   results are bit-identical for +, -, x and /:
+   - binary64 holds every exact binary32 sum and product, and rounds a
+     quotient finely enough that the second rounding cannot change the
+     binary32 result;
+   - the 25-bit rounding is the identity on a binary32 value.
+
+   The fused forms may differ by one binary32 ulp (double rounding). A
+   binary64 operand (from lfd or a double op) is rounded to binary32 first.
+   No bit-exactness is required. The payoff:
+   - the 25-bit rounding goes: 4 instructions per multiply, moving the value
+     to a GPR and back;
+   - a chain of single operations stays in binary32 registers, because clang
+     folds every `cvtsd2ss(cvtss2sd(x))` pair;
+   - the float_loop body below became a single `vmulss` between the load and
+     the store.
+3. **Fast forms** (`--fast-float-forms`). Several forms still went through
+   exact FPSCR or commit paths even in a fast-float module:
+   - `fres`, `frsqrte`, `ps_res` and `ps_rsqrte` called SoftFloat estimate
+     helpers and `ppc_commit_*` (ledger T-FEST);
+   - `fcmpu`, `fcmpo` and `ps_cmp*` updated FPSCR[FPCC] and tested for
+     signalling NaNs (T-FCMP);
+   - `fsel` and `ps_sel` were integer NaN and sign tests (T-FSEL).
+
+   With the flag they lower to `galaxy::fast` forms that write the register
+   file directly, so residency keeps the operands in locals:
+   - the reciprocals are correctly rounded rather than the 12-bit table
+     estimate, and game code's Newton-Raphson refinement converges from
+     either;
+   - the selects test `value >= 0.0`: NaN selects the second operand and -0
+     the first, as on the hardware;
+   - the compares set the CR field only.
+
+   With `--assume-paired-singles`, `require_paired_single_mode` is also gone
+   from every paired form (ledger T-PSMOV, header-only).
+
+### Emitted code (float_select probe: fsel, frsqrte, fres, fcmpo cr1)
+
+Before:
+
+```
+const std::uint64_t selector = context->fpr_bits[1];
+const bool select_nonnegative = !galaxy::f64_is_nan(selector) && ((selector & 0x8000000000000000ull) == 0 || (selector & 0x7FFFFFFFFFFFFFFFull) == 0);
+context->fpr_bits[3] = select_nonnegative ? context->fpr_bits[2] : context->fpr_bits[4];
+const galaxy::PpcFloatResult result = galaxy::ppc_f64_reciprocal_sqrt_estimate(context->fpr_bits[2], context->fpscr);
+galaxy::ppc_commit_scalar_result(context, 5u, result, false, false, services, 0x8070C004u);
+const std::uint64_t source = context->fpr_bits[2];
+const galaxy::PpcFloatResult result = galaxy::ppc_f64_reciprocal_estimate(source, context->fpscr);
+galaxy::ppc_commit_scalar_result(context, 6u, result, true, false, services, 0x8070C008u);
+galaxy::compare_f64(context, 1u, context->fpr_bits[5], context->fpr_bits[6], true);
+```
+
+After (`--fast-float-forms`):
+
+```
+context->fpr_bits[3] = galaxy::fast::select_nonnegative(context->fpr_bits[1]) ? context->fpr_bits[2] : context->fpr_bits[4];
+context->fpr_bits[5] = galaxy::fast::reciprocal_sqrt_bits(context->fpr_bits[2]);
+{ const std::uint64_t estimate = galaxy::fast::reciprocal_single_bits(context->fpr_bits[2]); context->fpr_bits[6] = estimate; if (galaxy::fast::duplicates_single(context)) context->ps1_bits[6] = estimate; }
+galaxy::fast::compare_f64_cr(context, 1u, context->fpr_bits[5], context->fpr_bits[6]);
+```
+
+`--single-float-arithmetic` changes no C++ text. Only `functions.h` gains the
+define.
+
+### Measured (asm loop, x86 instructions per executed guest instruction)
+
+The base is `$RELEASE`, the item 1 flags and `--abi-call-sync
+--abi-exit-sync`. "+res" adds `--experimental-guest-resident-float`, "+b32"
+adds `--single-float-arithmetic`, and "+forms" adds `--fast-float-forms`.
+Dynamic counts are from callgrind.
+
+| Probe | base | +res | +res +b32 | +res +b32 +forms |
+| --- | --- | --- | --- | --- |
+| float_single (lfs, fmuls, fadds, fmadds, stfs) | 6.4 | 5.8 | 5.1 | 5.1 |
+| float_double | 5.1 | 5.0 | 5.0 | 5.0 |
+| float_loop (lfs, fmuls f0,f0,f1, stfs in a loop) | 5.0 | 4.4 | 3.9 | 3.9 |
+| paired (psq_l, ps_mul, ps_madd, ps_sum0, psq_st) | 13.8 | 12.2 | 12.0 | 12.0 |
+| paired_mtx (PSMTXMultVec row) | 14.4 | 12.8 | 12.8 | 12.8 |
+| float_compare (fcmpu, fmr, fctiwz) | 11.5 | 11.5 | 11.5 | 9.5 |
+| float_select (fsel, frsqrte, fres, fcmpo) | 45.9 | 47.5 | 47.5 | 8.1 |
+| all 24 measured probes | 5.7 | 5.5 | 5.5 | 4.3 |
+
+### Risks
+
+- Binary32 arithmetic: a result differs from the hardware when an operand is
+  binary64 (lfd, double arithmetic, fctiwz output reinterpreted) or in a fused
+  double-rounding corner. Each differs by at most one binary32 ulp of the
+  result per operation, in the Dolphin/WiiCompiled accuracy class the fast-
+  float module already accepted. Deterministic replays that compare float
+  state bit for bit against `$RELEASE` will diverge; physics and animation
+  should not visibly change.
+- Estimates: games that use fres/frsqrte without refinement (rare) get a more
+  accurate value than the hardware.
+- Compares: FPSCR[FPCC] and the invalid-operation sticky bits are no longer
+  updated by compares. Only code that reads FPSCR (`mffs`) after a compare
+  would notice; RMGE01 reads FPSCR in OS context save/restore only.
+
+### Validation (Windows)
+
+1. `ctest -R native_single_float_arithmetic` (and the existing
+   `native_fast_float`, `native_assume_paired_singles`).
+2. `$RELEASE --abi-call-sync --abi-exit-sync --experimental-guest-resident-float
+   --single-float-arithmetic --fast-float-forms` builds; `functions.h` defines
+   `GALAXY_SINGLE_FLOAT_ARITHMETIC`; `grep -c "ppc_f64_reciprocal" functions_*.cpp`
+   is 0.
+3. `diff_sdkmath`, `diff_tier2`, `diff_tvec3`: expect last-bit float
+   differences only; review any larger one. `diff_gx` (vertex streams written
+   through psq_st) likewise.
+4. Routes and frame dumps: gameplay (camera, Mario physics, gravity fields),
+   Home menu, prologue movie, save. Visual comparison, not bit comparison.
+5. A/B each of the three flags alone and together, 3 rounds, 32 MB CCD.

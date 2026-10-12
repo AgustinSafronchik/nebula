@@ -214,4 +214,45 @@ a module built without the new flag never names the new helpers.
    - No runtime code changes.
    - The opt-out list is a generated file, `abi_contract.json`, next to the
      shards. Nothing in the runtime reads it.
+7. `--assume-paired-singles`, extended (ledger T-PSMOV)
+   - `runtime/include/galaxy/native_api.h` line 12156:
+     `require_paired_single_mode` is empty when the unit defines
+     `GALAXY_ASSUME_PAIRED_SINGLES`.
+     - This removes the HID2 load and test from ps_mr/ps_neg/ps_abs/ps_nabs,
+       ps_merge, ps_cmp, ps_res/ps_rsqrte and ps_sel.
+     - Without the macro the guest execution fault is unchanged.
+8. `--single-float-arithmetic` (work item: float arithmetic on typed locals)
+   - `runtime/include/galaxy/native_fast_paths.h`:
+     - Lines 34-50: `GALAXY_SINGLE_FLOAT_ARITHMETIC` and
+       `kSingleFloatArithmetic`. The constant is true only together with
+       `GALAXY_FAST_FLOAT`.
+     - Binary32 branches, all ahead of the unchanged binary64 code:
+       - `scalar_binary_fast` (836) and `scalar_ternary_fast` (867);
+       - `paired_binary_fast` (1183) and `paired_ternary_fast` (1204);
+       - `paired_sum_fast`.
+     - The binary32 pair helpers `SinglePair`, `to_single_pair`,
+       `from_single_pair`, `binary_single_pair` and `ternary_single_pair`
+       (1115-1165).
+   - `runtime/src/native_single_float_arithmetic_tests.cpp` (new) and
+     `CMakeLists.txt` lines 899-902, 1125 and 1176: the target
+     `galaxy_native_single_float_arithmetic_tests` (`ctest -R
+     native_single_float_arithmetic`). It is built with the fast-float,
+     single-arithmetic and paired-singles macros. It checks, over 2,000
+     operand pairs each:
+     - fadds/fsubs/fmuls/fdivs and ps_add/ps_mul/ps_div give the same bits as
+       the binary64 path;
+     - fmadds is within one binary32 ulp, and the ps_madd lanes match it;
+     - ps_sum0;
+     - the fast forms below;
+     - `require_paired_single_mode` is a no-op with HID2 clear.
+   - No runtime code changes.
+9. `--fast-float-forms` (same work item: no FPSCR bookkeeping or commit
+   helpers)
+   - `runtime/include/galaxy/native_fast_paths.h` line 1970, the section
+     "Fast float forms". It holds `reciprocal_single_bits` (1986),
+     `reciprocal_sqrt_bits`, `reciprocal_sqrt_single_bits`,
+     `select_nonnegative` and `compare_f64_cr` (2003). The compare sets the
+     CR field only.
+   - The generated code names these helpers only under the flag.
+   - No runtime code changes. Tested by the same target as item 8.
 
