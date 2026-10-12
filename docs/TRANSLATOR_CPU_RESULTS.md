@@ -159,3 +159,142 @@ plus fastmem, and the exact model.
 5. A/B with `ab-affinity` on the 32 MB-L3 CCD (`tools/ab-window.ps1` steady
    scene), 3 rounds paired: simulation-thread share, module size, `.text`
    size.
+
+---
+
+## 1.2 Checkpoint globals (`--checkpoint-globals`)
+
+### Design
+
+Every call-return checkpoint, and every budgeted backward-branch checkpoint
+once its local countdown expires, decided from the service table. After an
+opaque call the compiler has to re-read all of it:
+
+- `services->branch_checkpoint`;
+- `pending_event_mask`;
+- `runtime_flags`, for the trace and adaptive bits;
+- `checkpoint_counter` and `checkpoint_next_slow`, each null-tested;
+- then the counter, the watermark and the event mask behind those pointers.
+
+The service-table fields cannot simply be copied at load. The runtime's
+`checkpoint::GateController` republishes the two gate pointers at every
+host-callback scope entry and exit and at every fiber switch. The checkpoint
+callback also toggles the adaptive call-return bit at run time.
+
+With the flag, the module owns a snapshot of the gate decision,
+`galaxy::g_module_checkpoint_gate` (`ModuleCheckpointGateV1`). It has three
+pointer words and one flag:
+
+- `branch_counter` is the counter while the inline gate is published, the
+  table is complete and tracing is off.
+- `call_return_counter` is the same pointer, but only while adaptive
+  call-return checkpoints are on.
+- `next_slow` and `pending_event_mask` point at the watermark and the event
+  mask.
+- `call_return_quiet` allows a non-adaptive call return to finish on an
+  empty mask.
+
+`refresh_module_checkpoint_gate` derives the snapshot from the service table,
+and the runtime calls it whenever an input changes ("Runtime changes" in the
+task document lists the four call sites). The snapshot reproduces each
+existing decision exactly:
+
+| Test | Snapshot helper | Replaces |
+| --- | --- | --- |
+| Backward branch | `branch_checkpoint_due_g` | `branch_checkpoint_due` |
+| Budgeted backward branch | `branch_checkpoint_due_budgeted_g` | `branch_checkpoint_due_budgeted` |
+| Call return | `call_return_checkpoint_due_g` | `call_return_checkpoint_due` |
+| Interrupt transfer | `transfer_pending_g` | `transfer_pending` |
+
+`galaxy_native_module_checkpoint_gate_tests` checks this over 576 scenarios:
+the same counted value, the same counter advance and the same transfer
+answer in every service-table state.
+
+The module side:
+
+- **Generated text.** A textual post-pass over the final sources
+  (`apply_checkpoint_globals`) switches every checkpoint spelling to the
+  snapshot form: the resident inline tests, the non-resident
+  `GALAXY_*_CHECKPOINT*` macros, and the transfer tests in the cold blocks
+  and after `mtmsr`/`sc`/`mtdec`. The cold-path policy calls are unchanged
+  and still take `services`.
+- **Macro.** `functions.h` defines `GALAXY_MODULE_CHECKPOINT_GLOBALS 1`
+  before it includes the runtime header.
+- **Definition and export.** `module.cpp` defines the snapshot and exports
+  `galaxy_module_checkpoint_gate()`.
+- **Safe without runtime support.** An empty snapshot (the initial state, and
+  what a runtime without step 1 leaves) makes every test report
+  `kBranchCheckpointNotCounted`. Every checkpoint then runs the complete
+  service-table policy, which is correct and only slower. A partly
+  integrated runtime can therefore never make a checkpoint decide
+  differently, only slower.
+
+### Emitted code (one call and its return checkpoint)
+
+Non-resident body, before:
+```cpp
+    rmge01::fn_80004014(context, memory, services);
+    GALAXY_CALL_RETURN_CHECKPOINT(services, 0x80004004u, 0x80004008u, context, memory);
+```
+After:
+```cpp
+    rmge01::fn_80004014(context, memory, services);
+    GALAXY_CALL_RETURN_CHECKPOINT_G(services, 0x80004004u, 0x80004008u, context, memory);
+```
+Resident body, before and after:
+```cpp
+    if (const std::uint64_t counted__ = galaxy::call_return_checkpoint_due(services); counted__ != 0u) [[unlikely]] { shared_counted__ = counted__; shared_site__ = 0u; goto shared_call_return__; }
+    if (const std::uint64_t counted__ = galaxy::call_return_checkpoint_due_g(services); counted__ != 0u) [[unlikely]] { shared_counted__ = counted__; shared_site__ = 0u; goto shared_call_return__; }
+```
+
+x86 per call-return site, read from the compiled resident form:
+
+| Path | Before | After |
+| --- | --- | --- |
+| Adaptive (gameplay, AI DMA playing) | 26 instructions: 10 loads, 9 branches | 13 instructions: 6 loads (3 RIP-relative), 4 branches |
+| Non-adaptive | 14 instructions | 9 instructions |
+
+The non-resident macro form goes from 42 to 20 instructions per site
+(two-call probe: 83 to 41). Its transfer test now runs only on the cold
+path; a fast-path pass implies an empty event mask.
+
+### Risks
+
+- **Runtime integration.** A missed refresh site leaves a stale snapshot. A
+  stale published counter keeps counting inline inside a full scope (a
+  cadence change); a stale empty snapshot only costs speed. The four sites
+  are exhaustive for the current runtime: every write to
+  `checkpoint_counter`/`checkpoint_next_slow` goes through `GateController`,
+  and `runtime_flags` changes after init only at the adaptive toggle. A new
+  writer added later must refresh too. This is written in the header next to
+  the struct.
+- **Generated-code assumption.** The snapshot is re-read after every call.
+  The compiler cannot keep it in a register across an opaque call, because
+  the global escapes through the exported getter. Every refresh happens
+  inside such a call (host callbacks, fiber switches in SelectThread), so
+  translated code never sees a half-updated snapshot.
+- **Compatibility.** Module ABI 27 is unchanged. The export is optional: an
+  older runtime ignores it, and an older module has nothing to refresh.
+
+### Validation (Windows)
+
+1. Runtime first: apply the four refresh sites listed under "Runtime
+   changes" in the task document. `ctest -R
+   "native_module_checkpoint_gate|native_checkpoint_policy|checkpoint_gate"`
+   passes.
+2. `$RELEASE --checkpoint-globals`. The module builds with clang-cl. Grep
+   checks:
+   - `grep -c "call_return_checkpoint_due(services)" functions_*.cpp` is 0.
+   - `grep -c "GALAXY_CALL_RETURN_CHECKPOINT(services" functions_*.cpp` is 0.
+   - `dumpbin /exports RMGE01_game.dll` lists
+     `galaxy_module_checkpoint_gate`.
+3. Equivalence of the cadence: run the gameplay route with the
+   `[host-census]` line on, `$RELEASE` against `$RELEASE
+   --checkpoint-globals`, on the same runtime. Checkpoint bodies per run and
+   time-base reads must match within the route's run-to-run spread.
+   Flag-return counts are unchanged.
+4. Run the same module on a runtime without the refresh sites (the
+   fail-safe): it must boot and play the route with the same checkpoint body
+   counts, only a higher simulation-thread share.
+5. Routes: gameplay, Home menu, boot, save, prologue movie. A/B on the 32 MB
+   CCD steady scene, 3 rounds paired.

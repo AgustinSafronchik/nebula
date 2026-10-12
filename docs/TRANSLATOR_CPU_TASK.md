@@ -124,6 +124,51 @@ a module built without the new flag never names the new helpers.
      - Why: the generated code calls these helpers. The old helpers keep the
        flag-off path.
    - `runtime/src/native_hw_float_conversion_tests.cpp` (new) and
-     `CMakeLists.txt` lines 886-888, 1107, 1154: the
+     `CMakeLists.txt` lines 886-888, 1109, 1157: the
      `galaxy_native_hw_float_conversion_tests` target (`ctest -R
      native_hw_float_conversion`).
+2. `--checkpoint-globals` (work item 1.2). This one needs runtime code to
+   take effect; until that code exists, the module is correct but slower.
+   - `runtime/include/galaxy/native_api.h`:
+     - Line 15027: new section "Module checkpoint gate".
+       `ModuleCheckpointGateV1` (15057) is the module's snapshot of the
+       inline-gate decision. `refresh_module_checkpoint_gate` (15079)
+       derives it from the service table.
+     - Under `GALAXY_MODULE_CHECKPOINT_GLOBALS`: the module global
+       `g_module_checkpoint_gate` (15112), the snapshot tests
+       `branch_checkpoint_due_g` (15132),
+       `branch_checkpoint_due_budgeted_g` (15142),
+       `call_return_checkpoint_due_g` (15152) and `transfer_pending_g`
+       (15167), and the macros `GALAXY_RETURN_IF_TRANSFER_PENDING_G`,
+       `GALAXY_CALL_RETURN_CHECKPOINT_G`,
+       `GALAXY_BRANCH_CHECKPOINT_TAKEN_BUDGETED_G` and
+       `GALAXY_BRANCH_CHECKPOINT_TAKEN_G` (15175-15210).
+     - Line 16303: declaration of the optional export
+       `galaxy_module_checkpoint_gate()`.
+   - Runtime work to do (not in this branch). The runtime calls
+     `galaxy::refresh_module_checkpoint_gate(gate, &services)` in these
+     places:
+     - `runtime/src/native_runtime.cpp`, after `init_fn(&services)` succeeds
+       (about line 33495): look up the optional `galaxy_module_checkpoint_gate`
+       export (`load_export`), keep the pointer in the runtime state, and
+       refresh. The gate is already bound at line 33489.
+     - `runtime/src/checkpoint_gate.cpp`, `publish_full_unchecked` and
+       `publish_inline_unchecked`: after each publication. These cover bind,
+       unbind, activate, scope entry and exit, and `exchange_chain` on fiber
+       switches. Suggested shape: an optional `void (*)(void*)` observer that
+       `GateController` calls at the end of both functions.
+     - `runtime/src/native_runtime.cpp` lines 29064-29068: after the
+       checkpoint callback sets or clears
+       `kNativeServiceFlagAdaptiveCallReturnCheckpoints`.
+     - Before the module is unloaded or the service table is destroyed:
+       refresh with `nullptr`.
+     - Every one of these runs on the simulation thread, so no
+       synchronisation is needed. Translated code re-reads the snapshot after
+       every call, and every refresh happens inside a call.
+   - `runtime/src/native_module_checkpoint_gate_tests.cpp` (new) and
+     `CMakeLists.txt` lines 889-890, 1110, 1158: the
+     `galaxy_native_module_checkpoint_gate_tests` target. It covers 576
+     service-table scenarios: every flag, pointer, event and kind
+     combination, each through eight state changes. In all of them the
+     snapshot helpers return the same counted value, advance the counter the
+     same way and give the same transfer test as the service-table helpers.
