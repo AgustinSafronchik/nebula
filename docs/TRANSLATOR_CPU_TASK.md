@@ -190,4 +190,16 @@ a module built without the new flag never names the new helpers.
      build, and that is the guarantee this mode relies on.
 4. `--stack-r11-stores` (gap item 1: r1/r11 accesses skip the gather-pipe
    test): no runtime change. It uses the existing `fast::store_stack`.
+5. `--assume-paired-singles` (gap item 1: the second lane is always
+   written, because HID2[PSE] never changes in RMGE01)
+   - `runtime/include/galaxy/native_fast_paths.h`:
+     - Line 34: `GALAXY_ASSUME_PAIRED_SINGLES` / `kAssumePairedSingles`,
+       with `hid2_admits` (45) and `duplicates_single` (57).
+     - Every HID2 test in the fast paths now goes through those two
+       helpers: the psq admission tests, the ps1 fill of `lfs` and of the
+       single-precision results, and `paired_mode`. With the macro unset
+       they evaluate the same expressions as before.
+   - `runtime/src/native_assume_paired_singles_tests.cpp` (new) and its
+     `CMakeLists.txt` target `galaxy_native_assume_paired_singles_tests`.
+   - No runtime code changes.
 

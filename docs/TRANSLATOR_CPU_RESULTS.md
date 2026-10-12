@@ -440,3 +440,57 @@ gather-pipe append is skipped, and a stack frame can never be the pipe.
    functions_*.cpp` grows by about the number of `_savegpr` sites times
    their register counts.
 2. Routes as above. A/B on the 32 MB CCD steady scene, 3 rounds paired.
+
+---
+
+## 1.5 Paired singles always on (`--assume-paired-singles`)
+
+### Design
+
+Gap item 1 notes that the second lane is always written, because HID2.PSE
+never changes in RMGE01. Generation 25 applied this to `lfs` in fast-float
+modules. Three other paths still load and test `context->hid2`:
+
+- every psq load and store (HID2[PSE], plus [LSQE] for the d-forms);
+- every single-precision result, before it fills ps1 (`write_single`);
+- the exact-model paired admission (`paired_mode`).
+
+RMGE01 sets both bits in `__init_hardware`, before any game code runs, and
+never clears them. On the hardware a paired or quantized instruction with
+either bit clear raises an illegal-instruction exception. A running game
+therefore only executes these instructions with the bits set, and the test
+can never fail.
+
+With the flag, `functions.h` defines `GALAXY_ASSUME_PAIRED_SINGLES 1`. Every
+fast-path HID2 test then goes through `fast::hid2_admits`/`duplicates_single`
+and folds to `true`. GQR type dispatch and the exact fallbacks for the other
+types are unchanged.
+
+### Emitted code
+
+The C++ text is unchanged apart from the define in `functions.h`.
+
+| Sequence | Retired instructions (off to on) |
+| --- | --- |
+| lfs, lfs, fmuls, stfs | 79 to 76 |
+| Same, with `--hw-float-conversions` | 45 to 43 |
+| psq_l, ps_add, psq_st | 114 to 105 |
+| Same, with `--hw-float-conversions` | 78 to 69 |
+
+### Risks
+
+The flag changes behaviour only for code that runs a paired or quantized
+instruction, or reads ps1, with HID2[PSE]/[LSQE] clear. On the hardware that
+is an exception (paired), or ps1 of a register last written before
+`__init_hardware` (scalar single results). The boot path runs no float code
+before `__init_hardware`.
+
+### Validation (Windows)
+
+1. `ctest -R native_assume_paired_singles`.
+2. `$RELEASE --assume-paired-singles`: the module builds, and
+   `functions.h` carries the define.
+3. `diff_sdkmath`, `diff_tier2`, `diff_tvec3`, `diff_gx`: 0 mismatches.
+4. Boot and routes. A boot run with `GALAXY_TRACE_*` off must reach the title
+   exactly as `$RELEASE` does, since the boot path is where HID2 is set. A/B
+   on the 32 MB CCD steady scene.
