@@ -987,7 +987,7 @@ Done on this branch, each behind its own flag, default off, with tests in
 both flag states:
 
 - `--hw-float-conversions`
-- `--checkpoint-globals` (runtime refresh sites still to write; see
+- `--checkpoint-globals` (runtime refresh sites written on wt-cpu; see
   TRANSLATOR_CPU_TASK.md, Runtime changes 2)
 - `--flat-view-only`
 - `--stack-r11-stores`
@@ -1014,7 +1014,6 @@ Not done (open, in ledger order of the requested translator list):
   on change, GX draw-done/draw-sync as host calls, cached clock reads, a
   one-counter checkpoint body, idle-wait precision and the gather-pipe
   drain are designed in the ledger but not patched.
-- The `--checkpoint-globals` runtime refresh sites.
 
 Not verified:
 

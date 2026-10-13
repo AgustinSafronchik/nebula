@@ -145,26 +145,32 @@ a module built without the new flag never names the new helpers.
        `GALAXY_BRANCH_CHECKPOINT_TAKEN_G` (15175-15210).
      - Line 16303: declaration of the optional export
        `galaxy_module_checkpoint_gate()`.
-   - Runtime work to do (not in this branch). The runtime calls
-     `galaxy::refresh_module_checkpoint_gate(gate, &services)` in these
-     places:
-     - `runtime/src/native_runtime.cpp`, after `init_fn(&services)` succeeds
-       (about line 33495): look up the optional `galaxy_module_checkpoint_gate`
-       export (`load_export`), keep the pointer in the runtime state, and
-       refresh. The gate is already bound at line 33489.
-     - `runtime/src/checkpoint_gate.cpp`, `publish_full_unchecked` and
-       `publish_inline_unchecked`: after each publication. These cover bind,
-       unbind, activate, scope entry and exit, and `exchange_chain` on fiber
-       switches. Suggested shape: an optional `void (*)(void*)` observer that
-       `GateController` calls at the end of both functions.
-     - `runtime/src/native_runtime.cpp` lines 29064-29068: after the
-       checkpoint callback sets or clears
-       `kNativeServiceFlagAdaptiveCallReturnCheckpoints`.
-     - Before the module is unloaded or the service table is destroyed:
-       refresh with `nullptr`.
+   - Runtime refresh sites (wt-cpu). `RuntimeState::refresh_module_checkpoint_gate`
+     (`runtime/src/native_runtime.cpp` line 2275) calls
+     `galaxy::refresh_module_checkpoint_gate(gate, services)`:
+     - after `init_fn(&services)` succeeds (line 33705): the optional
+       `galaxy_module_checkpoint_gate` export is looked up, its pointer kept
+       in `RuntimeState::module_checkpoint_gate` (version 1 and a large enough
+       `struct_size`, otherwise ignored), the publish observer installed and
+       the snapshot refreshed. `[checkpoint] module-gate=0|1` in err.txt.
+     - `GateController::set_publish_observer`
+       (`runtime/include/galaxy/checkpoint_gate.h` line 178): an optional
+       `void (*)(void*) noexcept` that `publish_full_unchecked` and
+       `publish_inline_unchecked` (`runtime/src/checkpoint_gate.cpp`) call
+       after both slots hold their new values. This covers bind, unbind,
+       activate, scope entry and exit, and `exchange_chain` on fiber switches.
+     - after the checkpoint callback changes
+       `kNativeServiceFlagAdaptiveCallReturnCheckpoints` (line 29258), and
+       after the one-shot clear of `kNativeServiceFlagRelativeMarioInputAnchor`
+       (line 14082; not a snapshot input, refreshed to keep the rule "every
+       `runtime_flags` write refreshes").
+     - teardown (line 32838): the observer is removed and the snapshot
+       refreshed with `nullptr` before `unbind` and before the service table
+       and the module go away.
      - Every one of these runs on the simulation thread, so no
        synchronisation is needed. Translated code re-reads the snapshot after
        every call, and every refresh happens inside a call.
+     - `[checkpoint-module-gate] refreshes=` at shutdown counts the refreshes.
    - `runtime/src/native_module_checkpoint_gate_tests.cpp` (new) and
      `CMakeLists.txt` lines 889-890, 1110, 1158: the
      `galaxy_native_module_checkpoint_gate_tests` target. It covers 576
@@ -172,6 +178,11 @@ a module built without the new flag never names the new helpers.
      combination, each through eight state changes. In all of them the
      snapshot helpers return the same counted value, advance the counter the
      same way and give the same transfer test as the service-table helpers.
+     Its second part drives two `GateController`s (one with the observer)
+     through bind, activate, nested full scopes, an inline scope, an
+     `exchange_chain` round trip, the adaptive toggle, events, the watermark
+     and unbind, compares every decision after each step, and checks that the
+     observer runs once per publication and never sees half a publication.
 3. `--flat-view-only` (work item 1.3)
    - `runtime/include/galaxy/native_api.h`:
      - Line 8713: `GALAXY_FLAT_VIEW_ONLY_ACTIVE` (fastmem plus the
