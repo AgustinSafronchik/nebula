@@ -15,6 +15,7 @@
 #include <cstring>
 
 #include "dxr_rayquery_cs.h"
+#include "dxr_probe_cs.h"
 
 namespace galaxy::gx {
 
@@ -387,8 +388,9 @@ void DxrCapture::record(ID3D12GraphicsCommandList4* list) {
 
 // Reports which stage of the ray-query pass setup failed. On stderr, because a
 // failing setup is exactly when a buffered log would be lost.
-void dxr_trace_fail(const char* stage) {
-    std::fprintf(stderr, "[dxr-trace] init failed at %s\n", stage);
+void dxr_trace_fail(const char* stage, HRESULT hr) {
+    std::fprintf(stderr, "[dxr-trace] init failed at %s hr=0x%08lx\n", stage,
+                 static_cast<unsigned long>(hr));
 }
 
 bool DxrCapture::initialize_trace(unsigned width, unsigned height) {
@@ -434,25 +436,36 @@ bool DxrCapture::initialize_trace(unsigned width, unsigned height) {
     Microsoft::WRL::ComPtr<ID3DBlob> signature_error;
     if (FAILED(D3D12SerializeRootSignature(&signature, D3D_ROOT_SIGNATURE_VERSION_1,
                                           &signature_blob, &signature_error))) {
-        dxr_trace_fail("root-signature-serialise");
+        dxr_trace_fail("root-signature-serialise", S_OK);
         return false;
     }
     Microsoft::WRL::ComPtr<ID3D12RootSignature> root_signature;
     if (FAILED(device5_->CreateRootSignature(
             0, signature_blob->GetBufferPointer(), signature_blob->GetBufferSize(),
             IID_PPV_ARGS(&root_signature)))) {
-        dxr_trace_fail("root-signature-create");
+        dxr_trace_fail("root-signature-create", S_OK);
         return false;
     }
     trace_root_signature_ = root_signature;
 
     D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
     pso.pRootSignature = root_signature.Get();
-    pso.CS.pShaderBytecode = g_dxr_rayquery_cs_dxil;
-    pso.CS.BytecodeLength = g_dxr_rayquery_cs_dxil_size;
+    // GALAXY_DXR_PROBE=1 swaps in a shader with no RayQuery. The driver used
+    // here crashes its own shader compiler on any RayQuery shader, so this is
+    // the only way to exercise the dispatch, the output texture and the blend
+    // on this machine.
+    static const bool probe = [] {
+        char value[8]{};
+        std::size_t length = 0;
+        return getenv_s(&length, value, sizeof(value), "GALAXY_DXR_PROBE") == 0 &&
+               length > 1 && value[0] == '1';
+    }();
+    pso.CS.pShaderBytecode = probe ? g_dxr_probe_cs_dxil : g_dxr_rayquery_cs_dxil;
+    pso.CS.BytecodeLength = probe ? g_dxr_probe_cs_dxil_size
+                                  : g_dxr_rayquery_cs_dxil_size;
     if (FAILED(device5_->CreateComputePipelineState(&pso,
                                                     IID_PPV_ARGS(&trace_pso_)))) {
-        dxr_trace_fail("compute-pso");
+        dxr_trace_fail("compute-pso", S_OK);
         shutdown_trace();
         return false;
     }
@@ -463,7 +476,7 @@ bool DxrCapture::initialize_trace(unsigned width, unsigned height) {
     srv_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(device5_->CreateDescriptorHeap(&srv_desc,
                                               IID_PPV_ARGS(&trace_srv_heap_)))) {
-        dxr_trace_fail("srv-heap");
+        dxr_trace_fail("srv-heap", S_OK);
         shutdown_trace();
         return false;
     }
@@ -472,7 +485,7 @@ bool DxrCapture::initialize_trace(unsigned width, unsigned height) {
     uav_desc.NumDescriptors = 1;
     if (FAILED(device5_->CreateDescriptorHeap(&uav_desc,
                                               IID_PPV_ARGS(&trace_uav_heap_)))) {
-        dxr_trace_fail("uav-heap");
+        dxr_trace_fail("uav-heap", S_OK);
         shutdown_trace();
         return false;
     }
@@ -487,11 +500,12 @@ bool DxrCapture::initialize_trace(unsigned width, unsigned height) {
     output_desc.SampleDesc.Count = 1;
     output_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     output_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    if (FAILED(device5_->CreateCommittedResource(
-            &heap_properties[D3D12_HEAP_TYPE_DEFAULT], D3D12_HEAP_FLAG_NONE,
-            &output_desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
-            IID_PPV_ARGS(&trace_output_)))) {
-        dxr_trace_fail("output-texture");
+    const HRESULT hr = device5_->CreateCommittedResource(
+        &heap_properties[D3D12_HEAP_TYPE_DEFAULT], D3D12_HEAP_FLAG_NONE,
+        &output_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+        IID_PPV_ARGS(&trace_output_));
+    if (FAILED(hr)) {
+        dxr_trace_fail("output-texture", hr);
         shutdown_trace();
         return false;
     }
@@ -666,4 +680,9 @@ bool DxrCapture::grow(std::uint64_t result_bytes, std::uint64_t scratch_bytes) {
 }
 
 }  // namespace galaxy::gx
+
+
+
+
+
 

@@ -690,6 +690,22 @@ add_custom_command(OUTPUT "${galaxy_dxr_rq_header}"
     VERBATIM)
 set_source_files_properties("${galaxy_dxr_rq_header}" PROPERTIES GENERATED TRUE HEADER_FILE_ONLY TRUE)
 
+# Ray-query stand-in, selected with GALAXY_DXR_PROBE=1. Same entry point and
+# output texture as the real pass, no RayQuery, so the blend path can be
+# validated on drivers whose shader compiler cannot handle RayQuery.
+set(galaxy_dxr_probe_dxil "${galaxy_dxr_dir}/dxr_probe_cs.dxil")
+set(galaxy_dxr_probe_header "${galaxy_dxr_dir}/dxr_probe_cs.h")
+add_custom_command(OUTPUT "${galaxy_dxr_probe_header}"
+    COMMAND "${GALAXY_DXC}" -T cs_5_1 -E CSMain -Ges -Fo "${galaxy_dxr_probe_dxil}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime/src/gx/dxr_probe.hlsl"
+    COMMAND "${CMAKE_COMMAND}" -DINPUT=${galaxy_dxr_probe_dxil}
+        -DOUTPUT=${galaxy_dxr_probe_header} -DSYMBOL=g_dxr_probe_cs_dxil
+        -P "${galaxy_dxr_embed}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/runtime/src/gx/dxr_probe.hlsl" "${galaxy_dxr_embed}"
+    COMMENT "Compiling ray-query stand-in to DXIL"
+    VERBATIM)
+set_source_files_properties("${galaxy_dxr_probe_header}" PROPERTIES GENERATED TRUE HEADER_FILE_ONLY TRUE)
+
 # galaxy_gx: static lib used by NebulaRuntime and the renderer tests.
 # The public API (gx_d3d12.h) is implemented by gx_shim.cpp over GxBackend.
 add_library(galaxy_gx STATIC
@@ -701,6 +717,7 @@ add_library(galaxy_gx STATIC
     runtime/src/gx/render_config.cpp
     runtime/src/gx/renderer_d3d12.cpp
     runtime/src/gx/dxr_capture.cpp
+    "${galaxy_dxr_probe_header}"
     runtime/src/gx/window_owner.cpp
     runtime/src/gx/texture_cache.cpp
     runtime/src/gx/placed_texture_allocator.cpp
@@ -1307,3 +1324,4 @@ add_executable(galaxy_frame_telemetry_tests
 target_include_directories(galaxy_frame_telemetry_tests PRIVATE runtime/include)
 target_compile_features(galaxy_frame_telemetry_tests PRIVATE cxx_std_20)
 add_test(NAME galaxy_frame_telemetry_tests COMMAND galaxy_frame_telemetry_tests)
+
