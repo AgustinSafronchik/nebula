@@ -6512,7 +6512,21 @@ std::uint64_t RendererD3D12::end_frame(
             QueryPerformanceCounter(&begin);
             dxr_capture_.record(list4.Get());
             const DxrCaptureStats& stats = dxr_capture_.stats();
-            if (stats.ready && scene_projection_valid_) {
+            // The ray-query pipeline state is created even when the frame
+            // produced no acceleration structures, under
+            // GALAXY_DXR_FORCE_TRACE. That isolates the one thing this flag
+            // cannot answer on its own: whether the driver can compile a
+            // RayQuery shader at all. Compiling it does not depend on the
+            // structures being valid, so the test stays meaningful even while
+            // the top-level build is broken.
+            const bool force_trace = [] {
+                char value[8]{};
+                std::size_t length = 0;
+                return getenv_s(&length, value, sizeof(value),
+                                "GALAXY_DXR_FORCE_TRACE") == 0 &&
+                       length > 1 && value[0] == '1';
+            }();
+            if ((stats.ready || force_trace) && scene_projection_valid_) {
                 // The traced image covers the EFB the game rasterised into.
                 const unsigned trace_width = kEfbWidth * efb_scale_;
                 const unsigned trace_height = kEfbHeight * efb_scale_;

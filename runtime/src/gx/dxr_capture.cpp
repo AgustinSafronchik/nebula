@@ -457,6 +457,39 @@ void DxrCapture::record(ID3D12GraphicsCommandList4* list) {
 
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO top_info{};
     device5_->GetRaytracingAccelerationStructurePrebuildInfo(&top_inputs, &top_info);
+    // Dump the inputs to the top-level build. The build is the one command the
+    // bisect isolated as invalid, so what it is handed is the thing to look at
+    // rather than another guess about ordering.
+    {
+        std::fprintf(stderr,
+                     "[dxr-tlas] descs=%u instanceDescVA=%llx blasVA=%llx "
+                     "slot_result=%llu tlas=%llx tlasScratch=%llx\n",
+                     top_inputs.NumDescs,
+                     static_cast<unsigned long long>(top_inputs.InstanceDescs),
+                     static_cast<unsigned long long>(blas_results_->GetGPUVirtualAddress()),
+                     static_cast<unsigned long long>(slot_result_),
+                     static_cast<unsigned long long>(tlas_ ? tlas_->GetGPUVirtualAddress() : 0),
+                     static_cast<unsigned long long>(tlas_scratch_
+                                                        ? tlas_scratch_->GetGPUVirtualAddress()
+                                                        : 0));
+        std::fprintf(stderr,
+                     "[dxr-tlas] need result=%llu scratch=%llu, have result=%llu "
+                     "scratch=%llu\n",
+                     static_cast<unsigned long long>(top_info.ResultDataMaxSizeInBytes),
+                     static_cast<unsigned long long>(top_info.ScratchDataSizeInBytes),
+                     static_cast<unsigned long long>(tlas_result_bytes_),
+                     static_cast<unsigned long long>(tlas_scratch_bytes_));
+        for (unsigned i = 0; i < count && i < 4u; ++i) {
+            const D3D12_RAYTRACING_INSTANCE_DESC& d = instance_data_[i];
+            std::fprintf(stderr,
+                         "[dxr-tlas] inst[%u] asVA=%llx mask=0x%02x id=%u flags=%u hitGroup=%u m[0]={%g,%g,%g,%g}\n",
+                         i,
+                         static_cast<unsigned long long>(d.AccelerationStructure), d.InstanceMask,
+                         d.InstanceID, d.Flags,
+                         d.InstanceContributionToHitGroupIndex, d.Transform[0][0],
+                         d.Transform[0][1], d.Transform[0][2], d.Transform[0][3]);
+        }
+    }
     // Same persistence rule as the instance buffers: allocate once and only
     // when a larger frame arrives. Recreating the top-level structure every
     // frame frees memory the previous frame's traversal may still be using.
@@ -902,6 +935,7 @@ bool DxrCapture::grow(std::uint64_t result_bytes, std::uint64_t scratch_bytes) {
 }
 
 }  // namespace galaxy::gx
+
 
 
 
