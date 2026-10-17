@@ -155,6 +155,11 @@ private:
     std::uint64_t slot_result_ = 0;
     std::uint64_t slot_scratch_ = 0;
     std::uint32_t slot_count_ = 0;
+    // Allocated sizes for the per-frame top-level resources, so they are
+    // created once and only reallocated when a larger frame needs it.
+    std::uint64_t instance_bytes_ = 0;
+    std::uint64_t tlas_result_bytes_ = 0;
+    std::uint64_t tlas_scratch_bytes_ = 0;
 
     std::vector<D3D12_RAYTRACING_GEOMETRY_DESC> geometry_;
     std::vector<std::array<float, 12>> transforms_;
@@ -185,5 +190,6 @@ private:
 [[nodiscard]] bool dxr_capture_requested() noexcept;
 
 }  // namespace galaxy::gx
+
 
 

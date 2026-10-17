@@ -343,6 +343,26 @@ void DxrCapture::record(ID3D12GraphicsCommandList4* list) {
         return;
     }
 
+    // Stage limit for bisecting which recorded command invalidates the list.
+    // 0 = everything, 1 = bottom-level builds only, 2 = plus the instance copy
+    // and its transition, 3 = plus the top-level build.
+    static const int build_stage = [] {
+        char value[8]{};
+        std::size_t length = 0;
+        if (getenv_s(&length, value, sizeof(value), "GALAXY_DXR_BUILD_STAGE") != 0 ||
+            length < 2) {
+            return 0;
+        }
+        return value[0] - '0';
+    }();
+    if (build_stage == 1) {
+        geometry_.clear();
+        transforms_.clear();
+        instance_data_.clear();
+        tints_.clear();
+        return;
+    }
+
     const auto count = static_cast<std::uint32_t>(geometry_.size());
     std::uint64_t index_total = 0;
     for (std::uint32_t i = 0; i < count; ++i) {
@@ -404,14 +424,23 @@ void DxrCapture::record(ID3D12GraphicsCommandList4* list) {
 
     const std::uint64_t instance_bytes =
         instance_data_.size() * sizeof(D3D12_RAYTRACING_INSTANCE_DESC);
+    // These persist across frames and are only (re)allocated when they need to
+    // grow. Recreating them every frame destroys a resource the GPU may still be
+    // reading from the previous frame, which is what made the top-level build
+    // fail validation.
+    //
     // Staging on an upload heap, plus a copy on a DEFAULT heap in COMMON: the
     // top-level build may only read its instance descriptors in COMMON, and an
     // upload buffer is permanently GENERIC_READ.
-    if (!create_buffer(device5_.Get(), D3D12_HEAP_TYPE_UPLOAD, instance_bytes,
-                       D3D12_RESOURCE_STATE_GENERIC_READ, &instances_) ||
-        !create_buffer(device5_.Get(), D3D12_HEAP_TYPE_DEFAULT, instance_bytes,
-                       D3D12_RESOURCE_STATE_COPY_DEST, &instances_gpu_)) {
-        return;
+    if (instance_bytes > instance_bytes_ ||
+        instances_ == nullptr || instances_gpu_ == nullptr) {
+        if (!create_buffer(device5_.Get(), D3D12_HEAP_TYPE_UPLOAD, instance_bytes,
+                           D3D12_RESOURCE_STATE_GENERIC_READ, &instances_) ||
+            !create_buffer(device5_.Get(), D3D12_HEAP_TYPE_DEFAULT, instance_bytes,
+                           D3D12_RESOURCE_STATE_COPY_DEST, &instances_gpu_)) {
+            return;
+        }
+        instance_bytes_ = instance_bytes;
     }
     void* mapped = nullptr;
     if (FAILED(instances_->Map(0, nullptr, &mapped))) {
@@ -428,13 +457,22 @@ void DxrCapture::record(ID3D12GraphicsCommandList4* list) {
 
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO top_info{};
     device5_->GetRaytracingAccelerationStructurePrebuildInfo(&top_inputs, &top_info);
-    if (!create_buffer(device5_.Get(), D3D12_HEAP_TYPE_DEFAULT,
-                       top_info.ResultDataMaxSizeInBytes,
-                       D3D12_RESOURCE_STATE_COMMON, &tlas_) ||
-        !create_buffer(device5_.Get(), D3D12_HEAP_TYPE_DEFAULT,
-                       top_info.ScratchDataSizeInBytes,
-                       D3D12_RESOURCE_STATE_COMMON, &tlas_scratch_)) {
-        return;
+    // Same persistence rule as the instance buffers: allocate once and only
+    // when a larger frame arrives. Recreating the top-level structure every
+    // frame frees memory the previous frame's traversal may still be using.
+    if (top_info.ResultDataMaxSizeInBytes > tlas_result_bytes_ ||
+        top_info.ScratchDataSizeInBytes > tlas_scratch_bytes_ ||
+        tlas_ == nullptr || tlas_scratch_ == nullptr) {
+        if (!create_buffer(device5_.Get(), D3D12_HEAP_TYPE_DEFAULT,
+                           top_info.ResultDataMaxSizeInBytes,
+                           D3D12_RESOURCE_STATE_COMMON, &tlas_) ||
+            !create_buffer(device5_.Get(), D3D12_HEAP_TYPE_DEFAULT,
+                           top_info.ScratchDataSizeInBytes,
+                           D3D12_RESOURCE_STATE_COMMON, &tlas_scratch_)) {
+            return;
+        }
+        tlas_result_bytes_ = top_info.ResultDataMaxSizeInBytes;
+        tlas_scratch_bytes_ = top_info.ScratchDataSizeInBytes;
     }
 
     // Stage the descriptors, then move them into the COMMON copy the build
@@ -449,6 +487,13 @@ void DxrCapture::record(ID3D12GraphicsCommandList4* list) {
     to_common.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     to_common.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
     list->ResourceBarrier(1, &to_common);
+    if (build_stage == 2) {
+        geometry_.clear();
+        transforms_.clear();
+        instance_data_.clear();
+        tints_.clear();
+        return;
+    }
 
     // No barrier here on purpose. The build pools live in
     // D3D12_RESOURCE_STATE_COMMON, which is a superstate that permits the UAV
@@ -457,6 +502,21 @@ void DxrCapture::record(ID3D12GraphicsCommandList4* list) {
     // ID3D12GraphicsCommandList::Close fail with E_INVALIDARG. Ordering between
     // the structures and the tracing dispatch is handled by the transition in
     // record_trace() instead.
+    // The bottom-level builds above write the structures the top-level build
+    // references by address, and that dependency needs ordering. A UAV barrier
+    // is not usable here because the pools live in COMMON and a UAV barrier
+    // against a COMMON resource is invalid. Moving them into the
+    // ray-tracing-acceleration-structure state is the supported way to both
+    // order the writes against the reads and declare the state the traversal
+    // expects.
+    D3D12_RESOURCE_BARRIER to_as{};
+    to_as.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    to_as.Transition.pResource = blas_results_.Get();
+    to_as.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    to_as.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    to_as.Transition.StateAfter = D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE;
+    list->ResourceBarrier(1, &to_as);
+
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC top_build{};
     top_build.DestAccelerationStructureData = tlas_->GetGPUVirtualAddress();
     top_build.ScratchAccelerationStructureData = tlas_scratch_->GetGPUVirtualAddress();
