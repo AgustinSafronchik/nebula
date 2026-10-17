@@ -143,7 +143,12 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> blas_scratch_;
     Microsoft::WRL::ComPtr<ID3D12Resource> tlas_;
     Microsoft::WRL::ComPtr<ID3D12Resource> tlas_scratch_;
+    // Staging instance descriptors, filled on the CPU each frame.
     Microsoft::WRL::ComPtr<ID3D12Resource> instances_;
+    // Same bytes on a DEFAULT heap in COMMON, because a top-level build may
+    // only read its instance descriptors in COMMON and an upload buffer is
+    // permanently GENERIC_READ.
+    Microsoft::WRL::ComPtr<ID3D12Resource> instances_gpu_;
     // Shared sequential indices for non-indexed triangle lists.
     Microsoft::WRL::ComPtr<ID3D12Resource> sequential_indices_;
 
@@ -180,4 +185,5 @@ private:
 [[nodiscard]] bool dxr_capture_requested() noexcept;
 
 }  // namespace galaxy::gx
+
 

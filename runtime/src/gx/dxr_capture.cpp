@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 
 #include "dxr_rayquery_cs.h"
 #include "dxr_probe_cs.h"
@@ -55,6 +56,54 @@ D3D12_RESOURCE_DESC buffer_desc(std::uint64_t size) {
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     desc.Flags = D3D12_RESOURCE_FLAG_NONE;
     return desc;
+}
+
+// Uploads a one-off buffer copy and waits for it. Used during initialisation
+// for data that never changes, so it does not belong on the frame path.
+bool copy_buffer_once(ID3D12Device* device, ID3D12Resource* source,
+                      ID3D12Resource* destination, std::uint64_t bytes) {
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
+    D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    queue_desc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+    queue_desc.Priority = 0;
+    if (FAILED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue)))) {
+        return false;
+    }
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;
+    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                              IID_PPV_ARGS(&allocator))) ||
+        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                         allocator.Get(), nullptr,
+                                         IID_PPV_ARGS(&list)))) {
+        return false;
+    }
+    list->CopyBufferRegion(destination, 0, source, 0, bytes);
+    if (FAILED(list->Close())) {
+        return false;
+    }
+    ID3D12CommandList* lists[] = {list.Get()};
+    queue->ExecuteCommandLists(1, lists);
+    // The contents are needed before the first frame reads them, and nothing
+    // else is queued yet, so a blocking wait is the simplest correct thing.
+    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+    if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                   IID_PPV_ARGS(&fence)))) {
+        return false;
+    }
+    if (FAILED(queue->Signal(fence.Get(), 1))) {
+        return false;
+    }
+    // SetEventOnCompletion on the null handle means "do not signal an event",
+    // so the completion is polled instead.
+    if (FAILED(fence->SetEventOnCompletion(1, nullptr))) {
+        return false;
+    }
+    while (fence->GetCompletedValue() < 1) {
+        SwitchToThread();
+    }
+    return true;
 }
 
 bool create_buffer(ID3D12Device* device, D3D12_HEAP_TYPE heap_type,
@@ -128,25 +177,41 @@ bool DxrCapture::initialize(ID3D12Device* device, std::uint32_t capacity_hint) {
     // sequence, relative to its own vertex base, so one buffer serves all of
     // them. R16 matches Nebula's own index ring, which caps a draw at 65535
     // vertices.
+    //
+    // The destination must live on a DEFAULT heap in COMMON: an acceleration
+    // structure build may only read inputs in COMMON, and a resource on an
+    // UPLOAD heap is permanently GENERIC_READ and can never be transitioned out
+    // of it, so a BLAS cannot read indices straight out of one. The bytes are
+    // written once through a short-lived upload buffer and a one-off copy.
     std::vector<std::uint16_t> sequential(65536u);
     for (std::size_t i = 0; i < sequential.size(); ++i) {
         sequential[i] = static_cast<std::uint16_t>(i);
     }
-    if (!create_buffer(device, D3D12_HEAP_TYPE_UPLOAD,
-                       sequential.size() * sizeof(std::uint16_t),
-                       D3D12_RESOURCE_STATE_GENERIC_READ, &sequential_indices_)) {
+    const std::uint64_t sequential_bytes = sequential.size() * sizeof(std::uint16_t);
+    Microsoft::WRL::ComPtr<ID3D12Resource> staging;
+    if (!create_buffer(device, D3D12_HEAP_TYPE_UPLOAD, sequential_bytes,
+                       D3D12_RESOURCE_STATE_GENERIC_READ, &staging) ||
+        !create_buffer(device, D3D12_HEAP_TYPE_DEFAULT, sequential_bytes,
+                       D3D12_RESOURCE_STATE_COMMON, &sequential_indices_)) {
         std::printf("[dxr-capture] init failed: sequential index buffer\n");
         shutdown();
         return false;
     }
     void* mapped = nullptr;
-    if (FAILED(sequential_indices_->Map(0, nullptr, &mapped))) {
+    if (FAILED(staging->Map(0, nullptr, &mapped))) {
         std::printf("[dxr-capture] init failed: map sequential indices\n");
         shutdown();
         return false;
     }
-    std::memcpy(mapped, sequential.data(), sequential.size() * sizeof(std::uint16_t));
-    sequential_indices_->Unmap(0, nullptr);
+    std::memcpy(mapped, sequential.data(), sequential_bytes);
+    staging->Unmap(0, nullptr);
+    if (!copy_buffer_once(device, staging.Get(), sequential_indices_.Get(),
+                          sequential_bytes)) {
+        std::printf("[dxr-capture] init failed: sequential index copy\n");
+        shutdown();
+        return false;
+    }
+    staging.Reset();
 
     const std::uint32_t capacity = std::max<std::uint32_t>(capacity_hint, 256u);
     // A small primitive fits well inside 2 KiB; grow() raises this if a frame
@@ -339,8 +404,13 @@ void DxrCapture::record(ID3D12GraphicsCommandList4* list) {
 
     const std::uint64_t instance_bytes =
         instance_data_.size() * sizeof(D3D12_RAYTRACING_INSTANCE_DESC);
+    // Staging on an upload heap, plus a copy on a DEFAULT heap in COMMON: the
+    // top-level build may only read its instance descriptors in COMMON, and an
+    // upload buffer is permanently GENERIC_READ.
     if (!create_buffer(device5_.Get(), D3D12_HEAP_TYPE_UPLOAD, instance_bytes,
-                       D3D12_RESOURCE_STATE_GENERIC_READ, &instances_)) {
+                       D3D12_RESOURCE_STATE_GENERIC_READ, &instances_) ||
+        !create_buffer(device5_.Get(), D3D12_HEAP_TYPE_DEFAULT, instance_bytes,
+                       D3D12_RESOURCE_STATE_COPY_DEST, &instances_gpu_)) {
         return;
     }
     void* mapped = nullptr;
@@ -354,7 +424,7 @@ void DxrCapture::record(ID3D12GraphicsCommandList4* list) {
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS top_inputs{};
     top_inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
     top_inputs.NumDescs = count;
-    top_inputs.InstanceDescs = instances_->GetGPUVirtualAddress();
+    top_inputs.InstanceDescs = instances_gpu_->GetGPUVirtualAddress();
 
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO top_info{};
     device5_->GetRaytracingAccelerationStructurePrebuildInfo(&top_inputs, &top_info);
@@ -366,6 +436,19 @@ void DxrCapture::record(ID3D12GraphicsCommandList4* list) {
                        D3D12_RESOURCE_STATE_COMMON, &tlas_scratch_)) {
         return;
     }
+
+    // Stage the descriptors, then move them into the COMMON copy the build
+    // reads from. Both halves are required: the copy cannot happen while the
+    // destination is still in COMMON, and the build cannot read COPY_DEST.
+    list->CopyBufferRegion(instances_gpu_.Get(), 0, instances_.Get(), 0,
+                           instance_bytes);
+    D3D12_RESOURCE_BARRIER to_common{};
+    to_common.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    to_common.Transition.pResource = instances_gpu_.Get();
+    to_common.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    to_common.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    to_common.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    list->ResourceBarrier(1, &to_common);
 
     // No barrier here on purpose. The build pools live in
     // D3D12_RESOURCE_STATE_COMMON, which is a superstate that permits the UAV
@@ -688,6 +771,33 @@ void DxrCapture::record_trace(ID3D12GraphicsCommandList4* list,
     output_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     list->ResourceBarrier(1, &output_barrier);
 
+    // Stage limit for bisecting which recorded command makes the list invalid.
+    // 0 = everything, 1 = nothing recorded here, 2 = barriers only,
+    // 3 = barriers and descriptors, 4 = full dispatch.
+    enum : int { kNothing = 1, kBarriers = 2, kDescriptors = 3 };
+    static const int early_stage = [] {
+        char value[8]{};
+        std::size_t length = 0;
+        if (getenv_s(&length, value, sizeof(value), "GALAXY_DXR_TRACE_STAGE") != 0 ||
+            length < 2) {
+            return 0;
+        }
+        return value[0] - '0';
+    }();
+    if (early_stage == kNothing) {
+        return;
+    }
+    // 0 = everything, 1 = transitions only, 2 = transitions plus descriptors,
+    // 3 = full dispatch.
+    static const int stage_limit = [] {
+        char value[8]{};
+        std::size_t length = 0;
+        if (getenv_s(&length, value, sizeof(value), "GALAXY_DXR_TRACE_STAGE") != 0 ||
+            length < 2) {
+            return 0;
+        }
+        return value[0] - '0';
+    }();
     // The ray-query pass has its own descriptor heaps, and D3D12 requires them
     // bound on the command list before the root tables that reference them are
     // set. Without this the tables resolve to descriptors the list cannot see
@@ -697,6 +807,9 @@ void DxrCapture::record_trace(ID3D12GraphicsCommandList4* list,
     list->SetComputeRootSignature(trace_root_signature_.Get());
     list->SetComputeRootDescriptorTable(0, tlas_gpu);
     list->SetComputeRootConstantBufferView(0, trace_params_address_);
+    if (early_stage == kBarriers) {
+        return;
+    }
     list->SetPipelineState(trace_pso_.Get());
     const auto groups_x = (trace_width_ + 7u) / 8u;
     const auto groups_y = (trace_height_ + 7u) / 8u;
@@ -729,6 +842,9 @@ bool DxrCapture::grow(std::uint64_t result_bytes, std::uint64_t scratch_bytes) {
 }
 
 }  // namespace galaxy::gx
+
+
+
 
 
 
