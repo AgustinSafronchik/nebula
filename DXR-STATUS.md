@@ -1,133 +1,134 @@
 # Estado del trabajo de ray tracing (DXR)
 
-Nota de handoff. Describe qué está implementado, qué **no** funciona todavía y qué
-queda por hacer. No es documentación de una característica terminada: **el ray tracing
-aún no se ve en pantalla.**
+Nota de cierre. El proyecto se deja pausado: **el ray tracing nunca se vio en
+pantalla**, y el camino se cerro por restricciones del entorno, no por el
+diseno de la solucion.
 
-## Cómo activarlo
+Todo el trabajo esta commiteado y el camino esta diagnosticado. Ver
+"Estado final" mas abajo para el resumen y para que se deberia retomar.
 
-Todo el camino es opt-in y está apagado por defecto. El juego se comporta igual que
-sin estos cambios si no defines las variables.
+## Como activarlo
+
+Todo el camino es opt-in y esta apagado por defecto. Sin estas variables el
+juego se comporta igual que sin estos cambios.
 
 ```
-GALAXY_DXR_CAPTURE=1     captura de estructuras de aceleración + pass de ray query
-GALAXY_DXR_MEASURE=1     contadores por draw (diagnóstico)
-GALAXY_DXR_BISECT=n      controles de bisección, ver abajo
+GALAXY_DXR_CAPTURE=1     captura de estructuras + pass de ray query
+GALAXY_DXR_PROBE=1       shader equivalente SIN ray query (ver pruebas)
+GALAXY_DXR_BLEND=<f>     intensidad del blend, 0 lo desactiva
+GALAXY_DXR_MEASURE=1     contadores por draw (diagnostico)
+GALAXY_DXR_BISECT=n      controles de bisection
+GALAXY_DXR_BUILD_STAGE=n    1 = solo BLAS, 2 = + copia de instancias
+GALAXY_DXR_TRACE_STAGE=n    1 = no graba el pass, 3 = completo
+GALAXY_DXR_FORCE_TRACE=1     crea el PSO aunque no haya estructuras
 ```
 
-Con `GALAXY_DXR_CAPTURE=1` el juego corre estable: sin device removal, sin cuelgue de
-GPU, y la captura registra geometría real sin rechazar ningún draw.
+## Que funciona
 
-## Qué funciona
+- **Build del shader.** DXC se busca en `third_party/dxc` o en el PATH, y CMake
+  compila `dxr_rayquery.hlsl` a DXIL (`cs_6_5`) y lo embebe con
+  `cmake/embed_binary.cmake`. RayQuery no tiene equivalente en DXBC, asi que
+  fxc no sirve.
 
-**Build del shader.** DXC está vendorizado en `third_party/dxc` (19.7 MB). CMake compila
-`runtime/src/gx/dxr_rayquery.hlsl` a DXIL con `-T cs_6_5` y lo embebe como array C vía
-`cmake/embed_binary.cmake`. Sin esto el build no tiene nada que cargar.
+- **Captura de acceleration structures.** `dxr_capture.{h,cpp}` construye una
+  BLAS por primitiva desde el vertex ring del frame (posiciones = 3 floats,
+  stride 144) y usa la matriz de mundo del draw como instancia de la TLAS. Sin
+  copia de vertices, sin cache persistente.
 
-**Captura de aceleración structures.** `runtime/src/gx/dxr_capture.{h,cpp}` construye una
-BLAS por primitiva directamente desde el vertex ring del frame (posiciones = 3 floats,
-stride 144) y usa la matriz de mundo del draw como transform de instancia en la TLAS.
-Sin copia de vértices, sin caché persistente, todo reconstruido por frame. Medido antes
-en un spike: 580 primitivas ≈ 1.3 ms.
+- **Validacion de entradas.** `add_draw()` rechaza indices fuera del rango real
+  del view, draws con mas indices que vertices, `vertex_count` sobre 65536 con
+  indices R16, y transform con NaN/Inf. Una estructura malformada no falla el
+  build: cuelga la GPU durante el traversal.
 
-**Validación de entradas.** `add_draw()` rechaza índices fuera del rango real del view del
-draw, draws no-indexeados con más índices que vértices, `vertex_count` por encima de 65536
-con índices R16, y transform con NaN/Inf.Motivo: una estructura malformada no falla el
-build, **cuelga la GPU durante el traversal**. Los contadores `skipped_out_of_range` y
-`skipped_non_finite_transform` dicen cuántos draws se descartan (actualmente 0).
+- **Compute pass RayQuery.** PSO, heaps, dispatch y salida a textura UAV en
+  `record_trace()`. Sombreado aproximado: tinte por instancia y una luz
+  direccional. Las texturas y materiales del juego NO estan bound, asi que no
+  es un espejo fiel de la imagen rasterizada.
 
-**Compute pass RayQuery.** PSO, heaps de descriptores, dispatch y salida a textura UAV,
-todo en `DxrCapture::record_trace()`. El shader traza rayos primarios desde la cámara del
-juego contra la TLAS del frame. Sombreado aproximado: tinte por instancia y una luz
-direccional. **Las texturas y materiales del juego no están bound en este pass**, así que
-no es un espejo fiel de la imagen rasterizada.
+- **Camara.** `capture_scene_projection()` pasa el bloque de constantes del
+  vertex shader (que ya es el view-projection completo) y el renderer lo
+  invierte por Gauss-Jordan. El rango de rayos sale de des-proyectar NDC
+  z=0 y z=1, no de los registros de proyeccion de GX (que aqui dan 0.5/1 y
+  recortan todos los rayos).
 
-**Cámara.** `GxBackend::capture_scene_projection()` pasa el bloque de constantes del vertex
-shader (que ya es el view-projection completo: `o.pos = mul(projection, wpos)`) al renderer,
-que lo invierte por Gauss-Jordan. Sin la cámara el pass no puede construir rayos.
+- **Blend.** `record_dxr()` compone la textura trazada sobre el frame. Compilado
+  por fxc a `ps_5_0`, o sea **no depende del driver ni de RayQuery**, y se puede
+  construir y depurar en hardware que no compila ray query.
 
-## Qué NO funciona
+## Bugs corregidos
 
-Tres bloqueos, en orden de dependencia:
+Cinco, todos reales. Ninguno producia salida visible, sino recursos invalidos:
 
-1. **`trace-ready=0`.** Con la cámara ya válida (`proj-valid=1`), `initialize_trace()` sigue
-   fallando en silencio y el PSO nunca se crea. Hay que registrar su HRESULT para ver por qué.
+1. `heap_properties` se indexaba por `D3D12_HEAP_TYPE`, cuyos valores arrancan en
+   1, no en 0. `heap_properties[D3D12_HEAP_TYPE_DEFAULT]` leia la entrada de
+   UPLOAD. Todos los recursos se creaban en el heap equivocado.
+2. Los builds de AS solo pueden leer entradas en `COMMON`, y un recurso en heap
+   UPLOAD esta permanentemente en `GENERIC_READ`. Los descriptores de instancia
+   y los indices secuenciales estaban en heaps UPLOAD.
+3. La TLAS, su scratch y los descriptores se recreaban cada frame, liberando
+   memoria que el traversal del frame anterior pudo leer.
+4. `SampleDesc.Quality` debe ser 1 y estaba en 0, lo que hacia invalida la
+   descripcion de la textura.
+5. Faltaba el rango UAV en la firma raiz para `u0`.
 
-2. **El rango de rayos está mal.** Log actual: `near=0.5 far=1`. Viene de la fórmula de
-   perspectiva de GX, que no es válida con `projtype=1`. Un rango `[0.5, 1]` en unidades de
-   mundo **recorta todos los rayos**, así que la imagen saldría vacía aunque el dispatch
-   corriera. Hay que derivarlo de la matriz, o usar un rango amplio por defecto.
+## Estado final: proyecto pausado
 
-3. **No hay blend.** Aunque el dispatch produzca una imagen correcta en su textura UAV,
-   **nada la lee**. Falta el slice E: componer el resultado en el blit de presentación y
-   exponer el toggle `rt_reflections`. Este es el trabajo grande que falta.
+Dos problemas quedan abiertos.
 
-## Una corrección importante sobre diagnósticos previos
+### 1. El driver no compila inline ray tracing
 
-Varias conclusiones anteriores fueron **erróneas por binarios obsoletos**: el chequeo de
-errores de compilación buscaba `" error "` mientras clang emite `error:`, así que los builds
-fallaban en silencio y se reinstalaba el binario anterior. Los symptoms `E_INVALIDARG`,
-`DXGI_ERROR_DEVICE_HUNG (0x887a0006)` y la conclusión de que `DxrCapture::initialize()` era
-el culpable **no eran reales**. Con binarios válidos y error checking correcto no hay
-ninguno de esos fallos.
+La 26.8.1 revienta su propio compilador de shaders con cualquier shader de
+inline ray tracing, incluido uno de seis lineas. Confirmado de forma aislada e
+independiente del punto 2: con `GALAXY_DXR_PROBE=1` (shader equivalente sin ray
+query) el proceso sobrevive; con el shader de ray query muere a los dos
+segundos en `amdxc64.dll`.
 
-Si retomas esto, verifica siempre que el build terminó antes de copiar el ejecutable.
+La unica via sin cambiar drivers seria ray tracing por *pipelines* (RTPSO), que
+usa un compilador distinto en el driver. Se evaluo y no es viable aca:
 
-## Detalles del entorno que importan
+- El SDK de Windows 19041 **no declara** `D3D12CreateStateObject` ni la API de
+  pipeline. Comprobado tambien en DirectX-Headers, MinGW y el paquete NuGet mas
+  reciente: ninguno la trae.
+- `d3d12.dll` **no exporta** `D3D12CreateStateObject` (verificado con
+  `GetProcAddress`). Si exporta `D3D12GetInterface`, que es la puerta correcta,
+  pero recorrerla obliga a declarar a mano varias interfaces COM con sus vtables
+  exactas: dias de trabajo, comportamiento indefinido si un metodo queda
+  descolocado, y sin garantia de que el driver compile el pipeline.
 
-El `d3d12.h` que trae el toolchain de Nebula es de un SDK de ~2017 (MIDL 8.01). Falta
-`CopyTextureToBuffer` y `CopyBufferToMemory` (no hay readback por GPU posible),
-`GetDescriptorTableFromHeap`, y `CreateRootSignature` solo existe en su forma serializada
-(hay que pasar por `D3D12SerializeRootSignature`).
+### 2. El build de la TLAS falla con E_INVALIDARG
 
-`D3D12_RAYTRACING_ACCELERATION_STRUCTURE_SRV` contiene `Location` (una dirección), no un
-puntero a recurso.
+`ID3D12GraphicsCommandList::Close()` devuelve `0x80070057`. Aislado a ese unico
+comando con `GALAXY_DXR_BUILD_STAGE`: los builds de nivel inferior funcionan. Los
+descriptores de instancia se verificaron validos (alineados a 256 bytes, mascaras
+correctas, transformadas identidad). Se descartaron como causa el orden de las
+barreras, los estados de recursos, la alineacion y la recreacion por frame.
 
-Una barrera UAV explícita contra un recurso en `D3D12_RESOURCE_STATE_COMMON` es **inválida**
-y hace fallar `ID3D12GraphicsCommandList::Close()` con `E_INVALIDARG`. El orden entre el
-build de la TLAS y el dispatch se resuelve transicionando la estructura a
-`D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE`.
+## Que haria distinto
 
-## Controles de bisección
+Casi todos los bloqueos fueron del entorno, y varios los fabrique yo.
 
-`GALAXY_DXR_BISECT` sirve para localizar en qué subsistema falla, sin casos raros:
+- **El peor fue mio.** El chequeo de errores de compilacion buscaba
+  `" error "` mientras el compilador emite `error:`. No detectaba fallos,
+  reinstalaba el binario viejo y yo diagnosticaba sobre datos de una version
+  anterior. Costo horas de conclusiones falsas que parecian razonamiento solido.
 
-- `1` — construye las estructuras, no despacha.
-- `2` — despacha contra TLAS vacía (ningún rayo atraviesa geometría real).
-- `3` — captura inicializada, cero comandos DXR grabados.
-- `4` — captura inicializada, pero nunca se llama a `add_draw`.
+- Lo que si funciono, siempre, fue **mirar el estado real en el punto del
+  fallo**. `heap: type=2` resolvio en un paso lo que tres hipotesis no
+  pudieron. Los descriptores de instancia descartaron de golpe la causa mas
+  probable. El bisect por etapas localizo el fallo en un comando.
 
-Estos se usaron para descartar de forma concluyente el build de AS y el RayQuery como
-causa del fallo. Son baratos e inertes; conviene conservarlos hasta que el pass funcione.
+- **Probar el flag antes de medir.** Una corrida sin `GALAXY_DXR_CAPTURE` dio un
+  "sobrevive" falso que invalido toda una tanda de resultados.
 
-## Estado del toggle del juego
+- **Medir antes de prometer.** En varios momentos anuncie antes de verificar,
+  y luego los datos no dieron lo que esperaba.
 
-`runtime/src/gx/render_config.cpp` sigue forzando `ray_tracing_enabled`, `rt_ao_enabled` y
-`rt_reflections` a `false`. No se ha tocado todavía: el pass experimental se controla solo
-con `GALAXY_DXR_CAPTURE`.
+## Si se retoma
 
-## DXC no está en el repositorio
+1. Probar el rollback del driver. Es lo unico que ataca la causa directa del
+   punto 1, y es barato.
+2. Solo con hardware capaz de compilar ray tracing, seguir con el punto 2. Con
+   datos validos y un build que funciona, el `E_INVALIDARG` probablemente sea del
+   SDK de 2017, igual que `D3D12CreateStateObject`.
 
-El shader RayQuery necesita **DXC**, no fxc: RayQuery no tiene equivalente en DXBC y
-D3D12 requiere el contenedor DXIL. El `d3d12.h` del toolchain es de 2017 y su fxc no
-puede emitirlo.
-
-`third_party/dxc/` está en `.gitignore` a propósito: son ~20 MB de binario que no cambian
-nunca y que ensuciarían el historial para siempre. En su lugar, CMake lo busca primero en
-`third_party/dxc` y luego en el `PATH`. Si no lo encuentra, la configuración falla con un
-mensaje claro en vez de dejar el header del shader vacío en silencio.
-
-Para compilar el pass hace falta DXC en el PATH. Descarga: <https://github.com/microsoft/DirectXShaderCompiler/releases>
-(el paquete `dxc_YYYY_MM_DD.zip`). Verifica con `dxc --version`; necesitas 1.9 o posterior,
-porque los opcodes de RayQuery no son válidos antes de `cs_6_3` y este shader usa `cs_6_5`.
-
-El build de todo lo demás no necesita DXC: solo lo necesita el target que genera el shader.
-
-
-## Siguientes pasos
-
-1. Registrar el HRESULT de `initialize_trace()` y arreglarlo.
-2. Derivar `near`/`far` de la matriz, no de los registros de proyección de GX.
-3. Slice E: blend de la textura trazada en el blit de presentación + toggle.
-4. Con material y texturas bound en el pass, el sombreado deja de ser aproximado.
-5. Retirar `GALAXY_DXR_MEASURE` y los contadores cuando el pass sea estable.
+Con un entorno que funcione, el codigo existente deberia servir.
