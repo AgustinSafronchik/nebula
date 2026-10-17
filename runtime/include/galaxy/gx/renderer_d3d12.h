@@ -880,6 +880,9 @@ private:
     float scene_jitter_[2]{};
     float scene_camera_[3]{1.0f, 100000.0f, 1.0f};
     float scene_inverse_projection_[16]{};
+    // Near and far for the ray-query pass, derived from the inverse projection
+    // rather than the GX projection registers.
+    float scene_ray_range_[2]{0.1f, 100000.0f};
     bool scene_projection_valid_ = false;
     unsigned dxr_trace_width_ = 0;
     unsigned dxr_trace_height_ = 0;

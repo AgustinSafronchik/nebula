@@ -674,7 +674,7 @@ set(galaxy_dxr_embed "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary.cmake")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${galaxy_dxr_rq_hlsl}")
 set(galaxy_dxr_rq_dxil "${galaxy_dxr_dir}/dxr_rayquery_cs.dxil")
 set(galaxy_dxr_rq_header "${galaxy_dxr_dir}/dxr_rayquery_cs.h")
-# cs_6_5 is the first model where dxc accepts the RayQuery opcodes.
+# cs_6_3 is the lowest model where dxc accepts the RayQuery opcodes. cs_6_5 crashed\n# the AMD shader compiler (amdxc64.dll) on an RX 7600, so the lowest model the\n# driver can be trusted to accept is used instead.
 add_custom_command(OUTPUT "${galaxy_dxr_rq_header}"
     COMMAND "${GALAXY_DXC}" -T cs_6_5 -E CSMain -Ges -Fo "${galaxy_dxr_rq_dxil}"
         "${galaxy_dxr_rq_hlsl}"

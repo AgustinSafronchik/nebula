@@ -385,6 +385,12 @@ void DxrCapture::record(ID3D12GraphicsCommandList4* list) {
     instance_data_.clear();
 }
 
+// Reports which stage of the ray-query pass setup failed. On stderr, because a
+// failing setup is exactly when a buffered log would be lost.
+void dxr_trace_fail(const char* stage) {
+    std::fprintf(stderr, "[dxr-trace] init failed at %s\n", stage);
+}
+
 bool DxrCapture::initialize_trace(unsigned width, unsigned height) {
     if (!usable_ || device5_ == nullptr || width == 0u || height == 0u) {
         return false;
@@ -394,15 +400,21 @@ bool DxrCapture::initialize_trace(unsigned width, unsigned height) {
     trace_width_ = width;
     trace_height_ = height;
 
-    // One root descriptor table (top-level structure, instance tints, output)
-    // and one root constant buffer for the ray parameters.
-    D3D12_DESCRIPTOR_RANGE table_range{};
-    table_range.NumDescriptors = 3;
-    table_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    // The shader binds the instance tints and the top-level structure as SRVs
+    // (t1, t2) and writes the image through a UAV (u0). A UAV binding needs a
+    // UAV descriptor range; a table of SRV-type ranges alone does not satisfy
+    // it, and CreateComputePipelineState rejects the mismatch.
+    D3D12_DESCRIPTOR_RANGE ranges[2]{};
+    ranges[0].NumDescriptors = 2;  // t1 instance tints, t2 top level structure
+    ranges[0].BaseShaderRegister = 1;
+    ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[1].NumDescriptors = 1;  // u0 traced image
+    ranges[1].BaseShaderRegister = 0;
+    ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
     D3D12_ROOT_PARAMETER parameter{};
     parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    parameter.DescriptorTable.NumDescriptorRanges = 1;
-    parameter.DescriptorTable.pDescriptorRanges = &table_range;
+    parameter.DescriptorTable.NumDescriptorRanges = 2;
+    parameter.DescriptorTable.pDescriptorRanges = ranges;
     parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     D3D12_ROOT_DESCRIPTOR cbv{};
     cbv.ShaderRegister = 0;  // shader register b0
@@ -422,12 +434,14 @@ bool DxrCapture::initialize_trace(unsigned width, unsigned height) {
     Microsoft::WRL::ComPtr<ID3DBlob> signature_error;
     if (FAILED(D3D12SerializeRootSignature(&signature, D3D_ROOT_SIGNATURE_VERSION_1,
                                           &signature_blob, &signature_error))) {
+        dxr_trace_fail("root-signature-serialise");
         return false;
     }
     Microsoft::WRL::ComPtr<ID3D12RootSignature> root_signature;
     if (FAILED(device5_->CreateRootSignature(
             0, signature_blob->GetBufferPointer(), signature_blob->GetBufferSize(),
             IID_PPV_ARGS(&root_signature)))) {
+        dxr_trace_fail("root-signature-create");
         return false;
     }
     trace_root_signature_ = root_signature;
@@ -438,6 +452,7 @@ bool DxrCapture::initialize_trace(unsigned width, unsigned height) {
     pso.CS.BytecodeLength = g_dxr_rayquery_cs_dxil_size;
     if (FAILED(device5_->CreateComputePipelineState(&pso,
                                                     IID_PPV_ARGS(&trace_pso_)))) {
+        dxr_trace_fail("compute-pso");
         shutdown_trace();
         return false;
     }
@@ -448,6 +463,7 @@ bool DxrCapture::initialize_trace(unsigned width, unsigned height) {
     srv_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(device5_->CreateDescriptorHeap(&srv_desc,
                                               IID_PPV_ARGS(&trace_srv_heap_)))) {
+        dxr_trace_fail("srv-heap");
         shutdown_trace();
         return false;
     }
@@ -456,6 +472,7 @@ bool DxrCapture::initialize_trace(unsigned width, unsigned height) {
     uav_desc.NumDescriptors = 1;
     if (FAILED(device5_->CreateDescriptorHeap(&uav_desc,
                                               IID_PPV_ARGS(&trace_uav_heap_)))) {
+        dxr_trace_fail("uav-heap");
         shutdown_trace();
         return false;
     }
@@ -474,6 +491,7 @@ bool DxrCapture::initialize_trace(unsigned width, unsigned height) {
             &heap_properties[D3D12_HEAP_TYPE_DEFAULT], D3D12_HEAP_FLAG_NONE,
             &output_desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
             IID_PPV_ARGS(&trace_output_)))) {
+        dxr_trace_fail("output-texture");
         shutdown_trace();
         return false;
     }
@@ -648,3 +666,4 @@ bool DxrCapture::grow(std::uint64_t result_bytes, std::uint64_t scratch_bytes) {
 }
 
 }  // namespace galaxy::gx
+

@@ -6256,21 +6256,12 @@ void GxBackend::capture_scene_projection(const GxVsConstants& cpu) {
     if (!renderer_.set_scene_projection(matrix)) {
         return;
     }
-    // Range taken from the projection's depth parameters when they are usable,
-    // otherwise the renderer's defaults, which are wide enough for a first
-    // traced image.
-    const float c = xf_float(xf::kProjectionBase + 2u);
-    const float e = xf_float(xf::kProjectionBase + 4u);
-    const float f = xf_float(xf::kProjectionBase + 5u);
-    const float near_plane = f / (e - 1.0f);
-    const float far_plane = f / e;
-    const float fov_y = c != 0.0f ? 2.0f * std::atan(1.0f / std::fabs(c)) : 1.0f;
-    if (std::isfinite(near_plane) && std::isfinite(far_plane) &&
-        far_plane > near_plane) {
-        renderer_.set_scene_camera(near_plane, far_plane, fov_y);
-    }
+    // The ray range is derived from the inverse projection inside the renderer,
+    // not from the GX projection registers: those only describe a perspective
+    // projection and this scene reports type 1, which produced near=0.5 far=1
+    // and clipped every ray.
     scene_camera_captured_ = true;
-    std::cerr << "[dxr-camera] captured near=" << near_plane << " far=" << far_plane
+    std::cerr << "[dxr-camera] captured, ray range derived from inverse"
               << std::endl;
 }
 

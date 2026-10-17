@@ -6523,7 +6523,8 @@ std::uint64_t RendererD3D12::end_frame(
                     if (bisect != 1) {
                         dxr_capture_.record_trace(list4.Get(),
                                                   scene_inverse_projection_,
-                                                  scene_camera_[0], scene_camera_[1],
+                                                  scene_ray_range_[0],
+                                                  scene_ray_range_[1],
                                                   1.0f, 1.0f);
                     }
                 }
@@ -6552,6 +6553,8 @@ std::uint64_t RendererD3D12::end_frame(
                         << " skipped-nan=" << dxr_capture_skipped_nan_
                         << " trace-ready=" << (dxr_trace_width_ != 0u ? 1 : 0)
                         << " proj-valid=" << (scene_projection_valid_ ? 1 : 0)
+                          << " ray-range=" << scene_ray_range_[0]
+                          << "/" << scene_ray_range_[1]
                         << " build-ms/frame="
                         << (dxr_capture_build_ms_ / 60.0)
                         << " device-removed=0x" << std::hex
@@ -7288,6 +7291,38 @@ bool RendererD3D12::set_scene_projection(const float projection[16]) noexcept {
         }
     }
     scene_projection_valid_ = true;
+
+    // Derive the ray range from the inverse matrix instead of the GX projection
+    // registers. Those registers only describe a perspective projection, and
+    // this scene reports projection type 1, so the register formula produced
+    // near=0.5 far=1 and clipped every ray.
+    //
+    // world = x*row0 + y*row1 + z*row2 + row3, so row3 is the camera position
+    // and unprojecting NDC z=0 and z=1 at screen centre brackets the scene depth
+    // exactly as the projection encodes it.
+    const auto row = [&](unsigned index) {
+        return scene_inverse_projection_ + index * 4u;
+    };
+    const auto unproject = [&](float z, float out[3]) {
+        for (unsigned i = 0; i < 3u; ++i) {
+            out[i] = row(2)[i] * z + row(3)[i];
+        }
+    };
+    float origin[3]{};
+    float far_point[3]{};
+    unproject(0.0f, origin);
+    unproject(1.0f, far_point);
+    const float dx = far_point[0] - origin[0];
+    const float dy = far_point[1] - origin[1];
+    const float dz = far_point[2] - origin[2];
+    const float span = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (std::isfinite(span) && span > 1.0f) {
+        scene_ray_range_[0] = span * 1.0e-3f;  // just off the near plane
+        scene_ray_range_[1] = span * 1.5f;     // past the far plane, with margin
+    } else {
+        scene_ray_range_[0] = 0.1f;
+        scene_ray_range_[1] = 100000.0f;
+    }
     return true;
 }
 
