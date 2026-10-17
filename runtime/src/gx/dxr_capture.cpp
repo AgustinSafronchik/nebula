@@ -24,7 +24,11 @@ namespace {
 constexpr std::uint64_t kAlignment = 256;
 
 // Indexed by D3D12_HEAP_TYPE, used when creating the ray-query resources.
+// The enum starts at 1, so slot 0 is unused: indexing this array with a heap
+// type directly, which reads naturally at the call sites, only lands on the
+// right entry with that offset.
 constexpr D3D12_HEAP_PROPERTIES heap_properties[] = {
+    {},  // unused: D3D12_HEAP_TYPE_DEFAULT is 1, not 0
     {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
      D3D12_MEMORY_POOL_UNKNOWN, 0, 0},
     {D3D12_HEAP_TYPE_UPLOAD, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
@@ -496,8 +500,14 @@ bool DxrCapture::initialize_trace(unsigned width, unsigned height) {
     output_desc.Height = height;
     output_desc.DepthOrArraySize = 1;
     output_desc.MipLevels = 1;
-    output_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    // Float16 rather than UNORM: the blend samples this texture with a linear
+    // filter, and a filtered UNORM UAV is the combination older validation
+    // paths tend to reject.
+    output_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     output_desc.SampleDesc.Count = 1;
+    // SampleDesc.Quality must be 1; leaving it zeroed makes the whole
+    // description invalid and CreateCommittedResource returns E_INVALIDARG.
+    output_desc.SampleDesc.Quality = 1;
     output_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     output_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     const HRESULT hr = device5_->CreateCommittedResource(
@@ -505,6 +515,27 @@ bool DxrCapture::initialize_trace(unsigned width, unsigned height) {
         &output_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
         IID_PPV_ARGS(&trace_output_));
     if (FAILED(hr)) {
+        // Every field, because this description is the difference between a
+        // texture the engine creates successfully and one the runtime rejects.
+        // Comparing the two dumps is faster than guessing which field is wrong.
+        std::fprintf(stderr,
+                     "[dxr-trace] output desc: dim=%u layout=%u w=%llu h=%u "
+                     "array=%u mips=%u fmt=%u sample={count=%u quality=%u} "
+                     "flags=0x%x align=%u\n",
+                     static_cast<unsigned>(output_desc.Dimension),
+                     static_cast<unsigned>(output_desc.Layout),
+                     static_cast<unsigned long long>(output_desc.Width),
+                     output_desc.Height, static_cast<unsigned>(output_desc.DepthOrArraySize),
+                     output_desc.MipLevels, static_cast<unsigned>(output_desc.Format),
+                     output_desc.SampleDesc.Count, output_desc.SampleDesc.Quality,
+                     static_cast<unsigned>(output_desc.Flags),
+                     static_cast<unsigned>(output_desc.Alignment));
+        std::fprintf(stderr, "[dxr-trace] heap: type=%u page=%u pool=%u\n",
+                     static_cast<unsigned>(heap_properties[D3D12_HEAP_TYPE_DEFAULT].Type),
+                     static_cast<unsigned>(
+                         heap_properties[D3D12_HEAP_TYPE_DEFAULT].CPUPageProperty),
+                     static_cast<unsigned>(
+                         heap_properties[D3D12_HEAP_TYPE_DEFAULT].MemoryPoolPreference));
         dxr_trace_fail("output-texture", hr);
         shutdown_trace();
         return false;
@@ -640,11 +671,29 @@ void DxrCapture::record_trace(ID3D12GraphicsCommandList4* list,
     D3D12_CPU_DESCRIPTOR_HANDLE output_cpu =
         trace_uav_heap_->GetCPUDescriptorHandleForHeapStart();
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
-    uav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
     device5_->CreateUnorderedAccessView(trace_output_.Get(), nullptr, &uav,
                                         output_cpu);
 
+    // The output texture is created in COMMON; the dispatch writes it as a UAV,
+    // and the blend pass later transitions it out of UNORDERED_ACCESS to read
+    // it. Without this transition the states disagree and the command list
+    // fails to close.
+    D3D12_RESOURCE_BARRIER output_barrier{};
+    output_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    output_barrier.Transition.pResource = trace_output_.Get();
+    output_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    output_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    output_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    list->ResourceBarrier(1, &output_barrier);
+
+    // The ray-query pass has its own descriptor heaps, and D3D12 requires them
+    // bound on the command list before the root tables that reference them are
+    // set. Without this the tables resolve to descriptors the list cannot see
+    // and Close() fails with E_INVALIDARG.
+    ID3D12DescriptorHeap* heaps[2] = {trace_srv_heap_.Get(), trace_uav_heap_.Get()};
+    list->SetDescriptorHeaps(2, heaps);
     list->SetComputeRootSignature(trace_root_signature_.Get());
     list->SetComputeRootDescriptorTable(0, tlas_gpu);
     list->SetComputeRootConstantBufferView(0, trace_params_address_);
@@ -680,6 +729,11 @@ bool DxrCapture::grow(std::uint64_t result_bytes, std::uint64_t scratch_bytes) {
 }
 
 }  // namespace galaxy::gx
+
+
+
+
+
 
 
 
