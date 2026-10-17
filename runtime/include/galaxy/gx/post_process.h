@@ -68,6 +68,8 @@ struct PostProcessStatus {
     bool initialized = false;  // the chain exists (otherwise the plain blit)
     bool smaa_ok = false;      // pipelines, lookup textures and self-test
     bool fxaa_ok = false;
+    // Ray-traced overlay: true when the blend pipeline was created.
+    bool dxr_ok = false;
     std::array<char, 40> smaa_reason{};  // why SMAA is unavailable
     std::array<char, 40> fxaa_reason{};
     std::array<char, 40> skip_reason{};  // why last frame's wanted AA did not run
@@ -117,6 +119,16 @@ public:
     // `viewport` rectangle of `target_rtv`. Intermediate targets are kept
     // across frames and replaced only when a size changes; replaced
     // resources are released `frames_in_flight` frames later.
+
+    // Composites the ray-traced image over the rasterised scene into the same
+    // target the AA passes use, so the XFB blit picks the result up. Owns the
+    // traced texture only for the duration of the call: it transitions out of
+    // UNORDERED_ACCESS, because the ray-query pass left it there.
+    bool record_dxr(ID3D12GraphicsCommandList* list, DescriptorRing& srv_ring,
+                   ID3D12Resource* source, ID3D12Resource* traced,
+                   unsigned width, unsigned height, float strength,
+                   std::uint64_t frame_index, unsigned frames_in_flight);
+
     void record(ID3D12GraphicsCommandList* list,
                 DescriptorRing& srv_ring,
                 ID3D12Resource* source,
@@ -156,8 +168,11 @@ private:
         std::uint32_t con3[4];
         float params[4];
         std::int32_t origin[4];
+        // DXR blend: x strength, yzw unused. Last so the layout of the existing
+        // passes is untouched.
+        float dxr[4];
     };
-    static_assert(sizeof(Constants) == 28u * 4u);
+    static_assert(sizeof(Constants) == 32u * 4u);
 
     bool create_pipeline(D3D12_SHADER_BYTECODE vs, D3D12_SHADER_BYTECODE ps,
                          DXGI_FORMAT format, int stencil,
@@ -202,6 +217,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D12PipelineState> smaa_weights_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> smaa_blend_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> fxaa_;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> dxr_blend_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> easu_;
     // RCAS and the resample run into intermediates and into the back buffer;
     // both use RGBA8, so one pipeline each serves every target.
@@ -223,3 +239,7 @@ private:
 };
 
 }  // namespace galaxy::gx
+
+
+
+

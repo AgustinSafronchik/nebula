@@ -35,6 +35,7 @@
 #include "post_fsr_rcas_ps.h"
 #include "post_resample_ps.h"
 #include "post_fxaa_ps.h"
+#include "post_dxr_blend_ps.h"
 
 namespace galaxy::gx {
 namespace {
@@ -302,6 +303,12 @@ bool PostProcessor::initialize(ID3D12Device* device, ID3D12CommandQueue* queue,
         create_pipeline(code(bytes(g_post_smaa_blend_vs)), code(bytes(g_post_smaa_blend_ps)), kColorFormat, 0, smaa_blend_);
     const bool fxaa_pipeline = !test_fault("fxaa") &&
         create_pipeline(code(bytes(g_post_fullscreen_vs)), code(bytes(g_post_fxaa_ps)), kColorFormat, 0, fxaa_);
+    // Ray-traced overlay. Built like any other pass; if it fails the frame
+    // simply skips the blend, which is why the shader is kept independent
+    // of the ray-query pass itself.
+    const bool dxr_pipeline = !test_fault("dxr") &&
+        create_pipeline(code(bytes(g_post_fullscreen_vs)), code(bytes(g_post_dxr_blend_ps)),
+                        kColorFormat, 0, dxr_blend_);
 
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
@@ -344,6 +351,7 @@ bool PostProcessor::initialize(ID3D12Device* device, ID3D12CommandQueue* queue,
     status_.smaa_ok = smaa_pipelines && lookup_textures;
     status_.fxaa_ok = fxaa_pipeline;
     self_test(queue);
+    status_.dxr_ok = dxr_pipeline;
     status_.initialized = true;
     std::cerr << "[post-process] self-test smaa=" << (status_.smaa_ok ? "pass" : "fail")
               << (status_.smaa_ok ? "" : " smaa-reason=") << status_.smaa_reason.data()
@@ -606,6 +614,52 @@ bool PostProcessor::record_aa(ID3D12GraphicsCommandList* list, DescriptorRing& s
     transition(list, antialiased_, D3D12_RESOURCE_STATE_RENDER_TARGET);
     list->OMSetRenderTargets(1, &antialiased_.rtv, FALSE, nullptr);
     draw(list, srv_ring, smaa_blend_.Get(), {source, weights_.resource.Get()},
+         {kColorFormat, kColorFormat}, viewport, c);
+    transition(list, antialiased_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    return true;
+}
+
+bool PostProcessor::record_dxr(ID3D12GraphicsCommandList* list, DescriptorRing& srv_ring,
+                               ID3D12Resource* source, ID3D12Resource* traced,
+                               unsigned width, unsigned height, float strength,
+                               std::uint64_t frame_index, unsigned frames_in_flight) {
+    if (traced == nullptr || source == nullptr || !(strength > 0.0f) ||
+        dxr_blend_ == nullptr ||
+        (fault_targets_ && frame_index != 0u) ||
+        !ensure_target(antialiased_, width, height, kColorFormat, 2u, frame_index,
+                       frames_in_flight)) {
+        return false;
+    }
+
+    // The ray-query pass leaves the traced image in UNORDERED_ACCESS because the
+    // compute shader writes it. Reading it from a pixel shader needs a real
+    // transition; without it the whole command list fails to close.
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = traced;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    list->ResourceBarrier(1, &barrier);
+
+    list->SetGraphicsRootSignature(root_signature_.Get());
+    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    const D3D12_VIEWPORT viewport{
+        0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height), 0.0f, 1.0f};
+    Constants c{};
+    c.rt_metrics[0] = 1.0f / static_cast<float>(width);
+    c.rt_metrics[1] = 1.0f / static_cast<float>(height);
+    c.rt_metrics[2] = static_cast<float>(width);
+    c.rt_metrics[3] = static_cast<float>(height);
+    c.params[0] = static_cast<float>(width);
+    c.params[1] = static_cast<float>(height);
+    c.dxr[0] = strength;
+
+    transition(list, antialiased_, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    list->OMSetRenderTargets(1, &antialiased_.rtv, FALSE, nullptr);
+    // Writes the same target the AA passes use, so the XFB blit presents the
+    // composite without the caller having to know the blend ran.
+    draw(list, srv_ring, dxr_blend_.Get(), {source, traced},
          {kColorFormat, kColorFormat}, viewport, c);
     transition(list, antialiased_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     return true;
@@ -973,3 +1027,5 @@ std::string post_process_caps_text(const PostProcessStatus& status) {
 }
 
 }  // namespace galaxy::gx
+
+

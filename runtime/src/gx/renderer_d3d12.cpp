@@ -3274,6 +3274,19 @@ bool g_selected_adapter_valid = false;
 }  // namespace
 
 // DXR feasibility measurement gate, declared here because initialize() reads it.
+static float dxr_blend_strength() {
+    static const float strength = [] {
+        char value[16]{};
+        std::size_t length = 0;
+        if (getenv_s(&length, value, sizeof(value), "GALAXY_DXR_BLEND") != 0 ||
+            length < 2) {
+            return 0.0f;
+        }
+        return static_cast<float>(atof(value));
+    }();
+    return strength;
+}
+
 static int dxr_bisect_mode() {
     static const int mode = [] {
         char value[16]{};
@@ -10257,6 +10270,19 @@ bool RendererD3D12::present(
             command_list_.Get(), srv_ring_, source->texture.Get(),
             static_cast<unsigned>(source_desc.Width), source_desc.Height,
             back_rtv, vp, frame_index_, kFramesInFlight);
+        // Ray-traced overlay, on top of whatever the AA passes produced. Opt-in
+        // via GALAXY_DXR_BLEND so it can be compared against the rasterised frame,
+        // and skipped entirely when the traced image is absent.
+        if (dxr_capture_.trace_ready() && dxr_capture_.trace_texture() != nullptr) {
+            const float strength = dxr_blend_strength();
+            if (strength > 0.0f) {
+                post_process_.record_dxr(
+                    command_list_.Get(), srv_ring_, source->texture.Get(),
+                    dxr_capture_.trace_texture(),
+                    static_cast<unsigned>(source_desc.Width), source_desc.Height,
+                    strength, frame_index_, kFramesInFlight);
+            }
+        }
         // The overlay reads a copy: publish when what it shows changes.
         const PostProcessStatus& post = post_process_.status();
         static PostProcessStatus published{};
@@ -11111,3 +11137,4 @@ void native_settings_reset_overlay_state_for_tests() noexcept {
 }
 
 }  // namespace galaxy::gx
+

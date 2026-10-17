@@ -114,6 +114,11 @@ public:
 
     [[nodiscard]] const DxrCaptureStats& stats() const noexcept { return stats_; }
     [[nodiscard]] bool usable() const noexcept { return usable_; }
+    // True once the ray-query pipeline exists, and the image it writes.
+    [[nodiscard]] bool trace_ready() const noexcept { return trace_ready_; }
+    [[nodiscard]] ID3D12Resource* trace_texture() const noexcept {
+        return trace_output_.Get();
+    }
     [[nodiscard]] D3D12_GPU_VIRTUAL_ADDRESS top_level() const noexcept {
         return tlas_ ? tlas_->GetGPUVirtualAddress() : 0;
     }
@@ -175,3 +180,4 @@ private:
 [[nodiscard]] bool dxr_capture_requested() noexcept;
 
 }  // namespace galaxy::gx
+
