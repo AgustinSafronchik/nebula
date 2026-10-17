@@ -24,6 +24,9 @@ cbuffer PostConstants : register(b0) {
     float4 g_params;
     // xy: viewport origin in render-target pixels.
     int4 g_origin;
+    // DXR blend: x strength, yzw unused. Kept separate from g_params so the
+    // other passes keep their meaning unchanged.
+    float4 g_dxr;
 };
 
 SamplerState LinearSampler : register(s0);
@@ -152,6 +155,32 @@ BlendOut VSMain(uint id : SV_VertexID) {
 }
 float4 PSMain(BlendOut i) : SV_Target {
     return float4(SMAANeighborhoodBlendingPS(i.uv, i.offset, colorTex, blendTex).rgb, 1.0);
+}
+#endif
+
+#if defined(PASS_DXR_BLEND)
+// Composites the ray-traced image over the rasterised frame.
+//
+// This pass is deliberately plain Shader Model 5 pixel code: it is compiled by
+// the SDK's fxc and has no dependency on the inline ray-query pass, so the blend
+// can be built and debugged on hardware whose driver cannot compile RayQuery.
+//
+// t0 is the presented scene, t1 the traced image. The traced alpha carries how
+// much confidence the pass has per pixel (a ray that hit geometry), so pixels
+// with no traced coverage keep the rasterised image untouched and the result
+// reads as an overlay rather than a replacement.
+Texture2D sceneTex : register(t0);
+Texture2D tracedTex : register(t1);
+FullscreenOut VSMain(uint id : SV_VertexID) { return FullscreenTriangle(id); }
+float4 PSMain(FullscreenOut i) : SV_Target {
+    const float4 scene = sceneTex.Sample(LinearSampler, i.uv);
+    const float4 traced = tracedTex.Sample(LinearSampler, i.uv);
+    // Screen-style blend: lift the highlights where geometry was actually hit.
+    // g_dxr.x scales the whole contribution so the effect can be dialled and,
+    // at zero, make the pass a no-op.
+    const float amount = saturate(traced.a) * g_dxr.x;
+    const float3 lit = scene.rgb + traced.rgb * amount;
+    return float4(lit, scene.a);
 }
 #endif
 
