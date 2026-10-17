@@ -8,6 +8,7 @@
 #pragma comment(lib, "Synchronization.lib")
 #include "galaxy/windows_power.h"
 #include "galaxy/frame_timeline.h"
+#include "galaxy/dsp_timing_runtime.h"
 
 #include <algorithm>
 #include <chrono>
@@ -398,7 +399,17 @@ std::optional<CounterSource> invariant_tsc_counter_source(unsigned calibration_m
         return std::nullopt;
     }
     std::uint64_t remainder = 0u;
+#if defined(__clang__)
+    // clang-cl does not expose MSVC's _udiv128; the same portable 128/64
+    // restoring division native_runtime.cpp uses for its scaled counter covers
+    // this one too.
+    const auto scaled = galaxy::dsp_timing_runtime::detail::divide_u128_by_u64(
+        {high, low}, qpc_elapsed);
+    remainder = scaled.remainder;
+    const std::uint64_t tsc_hz = scaled.quotient;
+#else
     const std::uint64_t tsc_hz = _udiv128(high, low, qpc_elapsed, &remainder);
+#endif
     const std::uint64_t source_hz = tsc_hz >> kTscDivisorShift;
     if (source_hz <= kTimelineTicksPerSecond ||
         source_hz > kMaximumSupportedCounterFrequency) {
@@ -475,8 +486,13 @@ RuntimeTimeline::RuntimeTimeline(
         // floor(ticks_per_second * 2^64 / frequency): exact to one tick for
         // any delta below 2^64 counter units, monotone in the delta.
         std::uint64_t remainder = 0u;
+#if defined(__clang__)
+        scale_fixed64_ = galaxy::dsp_timing_runtime::detail::divide_u128_by_u64(
+            {kTimelineTicksPerSecond, 0u}, source_.frequency).quotient;
+#else
         scale_fixed64_ = _udiv128(
             kTimelineTicksPerSecond, 0u, source_.frequency, &remainder);
+#endif
     }
 }
 

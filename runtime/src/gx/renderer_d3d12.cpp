@@ -8,6 +8,7 @@
 #include "galaxy/gx/game_asset_extract.h"
 #include "galaxy/gx/render_config.h"
 #include "galaxy/gx/texture_cache.h"
+#include "galaxy/gx/vertex_loader.h"
 #include "galaxy/runtime_settings.h"
 #include "galaxy/scope_exit.h"
 #include "galaxy/native_host.h"
@@ -48,6 +49,9 @@
 using Microsoft::WRL::ComPtr;
 
 namespace galaxy::gx {
+
+extern std::uint64_t g_dxr_record_palette;
+extern std::uint64_t g_dxr_record_inline;
 
 std::string native_settings_row_text(
     unsigned tab, unsigned row,
@@ -3269,6 +3273,30 @@ bool g_selected_adapter_valid = false;
 
 }  // namespace
 
+// DXR feasibility measurement gate, declared here because initialize() reads it.
+static int dxr_bisect_mode() {
+    static const int mode = [] {
+        char value[16]{};
+        std::size_t length = 0;
+        if (getenv_s(&length, value, sizeof(value), "GALAXY_DXR_BISECT") != 0 ||
+            length < 2) {
+            return 0;
+        }
+        return value[1] - '0';
+    }();
+    return mode;
+}
+
+static bool dxr_measure_enabled_flag() {
+    static const bool enabled = [] {
+        char value[16]{};
+        std::size_t length = 0;
+        return getenv_s(&length, value, sizeof(value), "GALAXY_DXR_MEASURE") == 0 &&
+               length > 1 && value[0] == '1';
+    }();
+    return enabled;
+}
+
 // Out-of-line so the budget can be reported without exposing the anonymous-namespace
 // helper, and so both the eviction site and the telemetry read the same value.
 std::uint64_t RendererD3D12::efb_copy_dest_budget_bytes() {
@@ -4205,6 +4233,13 @@ bool RendererD3D12::initialize(int window_width, int window_height, unsigned efb
     fence_values_.fill(0);
     timestamp_pending_.fill(false);
     has_presented_swap_chain_ = false;
+    dxr_measure_enabled_ = dxr_measure_enabled_flag();
+    if (dxr_capture_ready_) {
+        QueryPerformanceFrequency(&dxr_capture_qpc_frequency_);
+        std::cout << "[dxr-capture] enabled: "
+                  << "per-frame acceleration structures, "
+                  << "BLAS in object space + instance transforms\n";
+    }
     window_shown_ = false;
     s_quit_requested.store(false, std::memory_order_release);
     const bool hidden_window = hidden_window_mode_enabled();
@@ -4821,6 +4856,14 @@ bool RendererD3D12::initialize(int window_width, int window_height, unsigned efb
     } catch (const std::exception& e) {
         std::cerr << "[Renderer] initialize failed: " << e.what() << "\n";
         return false;
+    }
+
+    // After the device exists, so the capture can query its ray tracing tier.
+    dxr_capture_ready_ =
+        dxr_capture_requested() && dxr_capture_.initialize(device_.Get(), 8u);
+    if (dxr_capture_requested()) {
+        std::cout << "[dxr-capture] requested=1 initialised="
+                  << (dxr_capture_ready_ ? 1 : 0) << '\n';
     }
     return true;
 }
@@ -5692,12 +5735,18 @@ void RendererD3D12::invalidate_gx_bindings() {
     bound_viewport_valid_ = false;
 }
 
-void RendererD3D12::begin_frame(bool present_swap_chain) {
+void RendererD3D12::begin_frame(bool present_swap_chain, FrameKind kind) {
     // Diagnostic stall watch, gated on its own opt-in flag. GALAXY_TRACE_STALL_WATCH is unset in the
     // shipped runtime-env.json, and trace_stall_watch_enabled() holds a function-local
     // `static const bool`, so with the flag off this is a constant false and clang deletes the
     // timestamps, the subtraction and the branch below outright.
     const bool stall_watch = trace_stall_watch_enabled();
+    // Frame-kind discriminator for the DXR capture. Present-only frames run on
+    // the present thread and never touch the capture, so it stays entirely on
+    // the render thread, where the draws that fill it are recorded.
+    if (dxr_capture_ready_ && kind == FrameKind::Render) [[unlikely]] {
+        dxr_capture_.begin_frame();
+    }
     const auto stall_watch_begin_frame_start = stall_watch
         ? std::chrono::steady_clock::now()
         : std::chrono::steady_clock::time_point{};
@@ -6206,6 +6255,10 @@ void RendererD3D12::present_to_swap_chain() {
         d3d_check(present_hr, "Present");
     }
     has_presented_swap_chain_ = true;
+    if (dxr_measure_enabled_) [[unlikely]] {
+        ++dxr_measure_frames_;
+        report_dxr_measurement();
+    }
     {
         LARGE_INTEGER now{};
         QueryPerformanceCounter(&now);
@@ -6408,7 +6461,8 @@ void RendererD3D12::present_to_swap_chain() {
 std::uint64_t RendererD3D12::end_frame(
     bool present_swap_chain,
     SubmissionCallback on_submitted,
-    void* submission_context) {
+    void* submission_context,
+    FrameKind kind) {
     if (timestamp_query_heap_ && timestamp_readback_) {
         command_list_->EndQuery(
             timestamp_query_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
@@ -6417,6 +6471,102 @@ std::uint64_t RendererD3D12::end_frame(
             timestamp_query_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
             frame_slot_ * 2u, 2u, timestamp_readback_.Get(),
             static_cast<UINT64>(frame_slot_) * 2u * sizeof(std::uint64_t));
+    }
+    // Acceleration structures are built here, on the render thread, right
+    // before the command list closes. They must be recorded after the draws
+    // that populate this frame's vertex and index rings, and before the list
+    // is submitted.
+    //
+    // Only for FrameKind::Render. end_frame() has two callers on two threads:
+    //   * GxBackend::render_frame_on_thread()   (render thread) -- issues every
+    //     draw, then closes the frame.
+    //   * GxBackend::present_cached_xfb_on_thread() (present thread) -- closes a
+    //     frame to present a cached XFB, issuing no draws at all.
+    // Gating on kind keeps the whole capture on the render thread: begin_frame,
+    // the per-draw add_draw calls and this record() all run there, in order,
+    // with no lock. Previously the present path also reached this block, which
+    // is why the instance count collapsed to 1-2 per second and the process
+    // could die.
+    if (dxr_capture_ready_ && kind == FrameKind::Render) [[unlikely]] {
+        // GALAXY_DXR_BISECT=3 keeps the capture initialised but records no DXR
+        // command at all. If Close still fails with E_INVALIDARG in this mode,
+        // the failure is not in the acceleration-structure build or the
+        // dispatch, and the bisection has been pointed at the wrong subsystem.
+        if (dxr_bisect_mode() != 3) {
+        ComPtr<ID3D12GraphicsCommandList4> list4;
+        if (SUCCEEDED(command_list_.As(&list4))) {
+            LARGE_INTEGER begin{};
+            QueryPerformanceCounter(&begin);
+            dxr_capture_.record(list4.Get());
+            const DxrCaptureStats& stats = dxr_capture_.stats();
+            if (stats.ready && scene_projection_valid_) {
+                // The traced image covers the EFB the game rasterised into.
+                const unsigned trace_width = kEfbWidth * efb_scale_;
+                const unsigned trace_height = kEfbHeight * efb_scale_;
+                if (trace_width != dxr_trace_width_ ||
+                    trace_height != dxr_trace_height_) {
+                    if (dxr_capture_.initialize_trace(trace_width, trace_height)) {
+                        dxr_trace_width_ = trace_width;
+                        dxr_trace_height_ = trace_height;
+                    }
+                }
+                if (dxr_trace_width_ != 0u) {
+                    // Bisection controls, so the failing subsystem can be named
+                    // instead of guessed at.
+                    //   GALAXY_DXR_BISECT=1 builds the structures and skips the
+                    //     dispatch: a clean device here exonerates the build.
+                    //   GALAXY_DXR_BISECT=2 dispatches against an empty
+                    //     top-level structure, so no ray traverses real
+                    //     geometry: a hang here is in the pass setup or the
+                    //     bindings rather than in the captured geometry.
+                    const int bisect = dxr_bisect_mode();
+                    if (bisect != 1) {
+                        dxr_capture_.record_trace(list4.Get(),
+                                                  scene_inverse_projection_,
+                                                  scene_camera_[0], scene_camera_[1],
+                                                  1.0f, 1.0f);
+                    }
+                }
+            }
+            LARGE_INTEGER end{};
+            QueryPerformanceCounter(&end);
+            const double build_ms =
+                dxr_capture_qpc_frequency_.QuadPart > 0
+                    ? static_cast<double>(end.QuadPart - begin.QuadPart) * 1000.0 /
+                          static_cast<double>(dxr_capture_qpc_frequency_.QuadPart)
+                    : 0.0;
+            dxr_capture_instances_ += stats.instances;
+            dxr_capture_tris_ += stats.triangles;
+            dxr_capture_skipped_range_ += stats.skipped_out_of_range;
+            dxr_capture_skipped_nan_ += stats.skipped_non_finite_transform;
+            dxr_capture_build_ms_ += build_ms;
+            if (++dxr_capture_frames_ >= 60u) {
+                // Written to stderr, which is unbuffered, and flushed. The
+                // pass is expected to be able to abort the process on a bad
+                // acceleration structure, and a buffered std::cout line is
+                // lost exactly when the diagnostic matters most.
+                std::ostringstream message;
+                message << "[dxr-capture] instances=" << (dxr_capture_instances_ / 60u)
+                        << " triangles/s=" << (dxr_capture_tris_ / 60u)
+                        << " skipped-range=" << dxr_capture_skipped_range_
+                        << " skipped-nan=" << dxr_capture_skipped_nan_
+                        << " trace-ready=" << (dxr_trace_width_ != 0u ? 1 : 0)
+                        << " proj-valid=" << (scene_projection_valid_ ? 1 : 0)
+                        << " build-ms/frame="
+                        << (dxr_capture_build_ms_ / 60.0)
+                        << " device-removed=0x" << std::hex
+                        << static_cast<unsigned long>(device_->GetDeviceRemovedReason())
+                        << std::dec << '\n';
+                std::cerr << message.str() << std::flush;
+                dxr_capture_frames_ = 0;
+                dxr_capture_instances_ = 0;
+                dxr_capture_tris_ = 0;
+                dxr_capture_skipped_range_ = 0;
+                dxr_capture_skipped_nan_ = 0;
+                dxr_capture_build_ms_ = 0.0;
+            }
+        }
+        }
     }
     const HRESULT close_hr = command_list_->Close();
     if (FAILED(close_hr)) {
@@ -7082,6 +7232,65 @@ void RendererD3D12::set_scene_camera(float near_plane, float far_plane, float fo
     scene_camera_[2] = fov_y;
 }
 
+bool RendererD3D12::set_scene_projection(const float projection[16]) noexcept {
+    if (projection == nullptr) {
+        return false;
+    }
+    // Gauss-Jordan with partial pivoting. The matrices are 4x4 and arrive once
+    // per captured frame, so clarity beats a specialised adjugate here.
+    double a[4][8]{};
+    for (unsigned row = 0; row < 4u; ++row) {
+        for (unsigned column = 0; column < 4u; ++column) {
+            a[row][column] = static_cast<double>(projection[row * 4u + column]);
+        }
+        a[row][4u + row] = 1.0;
+    }
+    for (unsigned pivot = 0; pivot < 4u; ++pivot) {
+        unsigned best = pivot;
+        for (unsigned row = pivot + 1u; row < 4u; ++row) {
+            if (std::fabs(a[row][pivot]) > std::fabs(a[best][pivot])) {
+                best = row;
+            }
+        }
+        if (std::fabs(a[best][pivot]) < 1e-12) {
+            // Singular: leave the previous matrix in place rather than feeding
+            // the ray pass garbage.
+            return false;
+        }
+        if (best != pivot) {
+            for (unsigned column = 0; column < 8u; ++column) {
+                const double swap = a[pivot][column];
+                a[pivot][column] = a[best][column];
+                a[best][column] = swap;
+            }
+        }
+        const double scale = a[pivot][pivot];
+        for (unsigned column = 0; column < 8u; ++column) {
+            a[pivot][column] /= scale;
+        }
+        for (unsigned row = 0; row < 4u; ++row) {
+            if (row == pivot) {
+                continue;
+            }
+            const double factor = a[row][pivot];
+            if (factor == 0.0) {
+                continue;
+            }
+            for (unsigned column = 0; column < 8u; ++column) {
+                a[row][column] -= factor * a[pivot][column];
+            }
+        }
+    }
+    for (unsigned row = 0; row < 4u; ++row) {
+        for (unsigned column = 0; column < 4u; ++column) {
+            scene_inverse_projection_[row * 4u + column] =
+                static_cast<float>(a[row][4u + column]);
+        }
+    }
+    scene_projection_valid_ = true;
+    return true;
+}
+
 bool RendererD3D12::record_temporal_upscale(unsigned output_scale) {
     if (!scene_temporal_ || !temporal_ || !ensure_motion_target()) {
         return false;
@@ -7543,7 +7752,108 @@ void RendererD3D12::clear_efb(
 // draw
 // ---------------------------------------------------------------------------
 
+// DXR feasibility measurement (temporary, gated on GALAXY_DXR_MEASURE=1).
+// Reports per-second totals for draws, indices and vertices, plus how many
+// primitives reference a single position/normal matrix index. A primitive with
+// one distinct index becomes one BLAS plus one TLAS instance transform; more
+// than one would need pre-transformed vertices or exclusion.
+void RendererD3D12::report_dxr_measurement() {
+    const VertexLoaderDiagnostics loader = vertex_loader_diagnostics();
+    const double seconds = static_cast<double>(dxr_measure_frames_) / 60.0;
+    if (seconds < 1.0) {
+        return;
+    }
+    const auto per_second = [&](std::uint64_t total) {
+        return seconds > 0.0 ? static_cast<double>(total) / seconds : 0.0;
+    };
+    std::ostringstream message;
+    message << "[dxr-measure] frames=" << dxr_measure_frames_ << '\n'
+            << "[dxr-measure] draws/s=" << per_second(dxr_measure_draws_)
+            << " indices/s=" << per_second(dxr_measure_indices_)
+            << " primitives/s=" << per_second(loader.primitives)
+            << " vertices/s=" << per_second(loader.vertices) << '\n'
+            << "[dxr-measure] single-matrix primitives/s="
+            << per_second(loader.single_matrix_primitives)
+            << " multi-matrix primitives/s="
+            << per_second(loader.multi_matrix_primitives)
+            << " max-distinct-matrices=" << loader.max_distinct_matrices << '\n'
+            << "[dxr-measure] distinct-matrix histogram"
+               " [1]=" << loader.matrix_index_histogram[1]
+            << " [2]=" << loader.matrix_index_histogram[2]
+            << " [3]=" << loader.matrix_index_histogram[3]
+            << " [4]=" << loader.matrix_index_histogram[4]
+            << " [5+]=" << (loader.matrix_index_histogram[5] +
+                             loader.matrix_index_histogram[6] +
+                             loader.matrix_index_histogram[7] +
+                             loader.matrix_index_histogram[8]) << '\n'
+            << "[dxr-measure] traceable instances/s="
+            << per_second(dxr_measure_traced_)
+            << " triangles/s=" << per_second(dxr_measure_traced_indices_)
+            << " vertices/s=" << per_second(dxr_measure_traced_vertices_)
+            << " (capture covers "
+            << (dxr_measure_draws_ > 0 ? dxr_measure_traced_ * 100 / dxr_measure_draws_ : 0)
+            << "% of draws)" << '\n'
+            << "[dxr-measure] palette draws/s=" << per_second(dxr_measure_palette_draws_)
+            << " inline-matrix draws/s=" << per_second(dxr_measure_inline_draws_)
+            << '\n'
+            << "[dxr-measure] record.palette splits this window: palette="
+            << g_dxr_record_palette << " inline=" << g_dxr_record_inline << '\n';
+    g_dxr_record_palette = 0;
+    g_dxr_record_inline = 0;
+    std::cout << message.str();
+
+    dxr_measure_frames_ = 0;
+    dxr_measure_draws_ = 0;
+    dxr_measure_indices_ = 0;
+    dxr_measure_traced_ = 0;
+    dxr_measure_traced_indices_ = 0;
+    dxr_measure_traced_vertices_ = 0;
+    dxr_measure_palette_draws_ = 0;
+    dxr_measure_inline_draws_ = 0;
+    reset_vertex_loader_diagnostics();
+}
+
 void RendererD3D12::draw(const DrawCall& call) {
+    if (dxr_measure_enabled_) [[unlikely]] {
+        ++dxr_measure_draws_;
+        dxr_measure_indices_ += call.index_count;
+        // Capture accounting: how much geometry would become acceleration
+        // structures this frame. Instances are whole draws (a batch is one
+        // contiguous range sharing a transform), so this is the BLAS count.
+        if (call.matrix_palette != 0) {
+            ++dxr_measure_palette_draws_;
+        } else {
+            ++dxr_measure_inline_draws_;
+        }
+        if (call.traceable) {
+            ++dxr_measure_traced_;
+            dxr_measure_traced_indices_ += call.index_count / 3u;
+            dxr_measure_traced_vertices_ +=
+                call.vertex_view.StrideInBytes != 0u
+                    ? call.vertex_view.SizeInBytes / call.vertex_view.StrideInBytes
+                    : 0u;
+        }
+    }
+    if (dxr_capture_ready_ && dxr_bisect_mode() != 4) [[unlikely]] {
+        ++dxr_capture_draws_seen_;
+        if (call.traceable) {
+            ++dxr_capture_traceable_;
+            DxrCaptureDraw captured{};
+            captured.vertex_base = call.vertex_view.BufferLocation;
+            captured.vertex_stride = call.vertex_view.StrideInBytes;
+            captured.vertex_count =
+                call.vertex_view.StrideInBytes != 0u
+                    ? call.vertex_view.SizeInBytes / call.vertex_view.StrideInBytes
+                    : 0u;
+            captured.index_base = call.index_view.BufferLocation;
+            captured.index_count = call.index_count;
+            captured.index_available =
+                call.index_view.SizeInBytes /
+                (call.index_view.Format == DXGI_FORMAT_R32_UINT ? 4u : 2u);
+            captured.transform = call.world_transform;
+            dxr_capture_.add_draw(captured);
+        }
+    }
     if (replay_recording_) [[unlikely]] {
         replay_ops_.push_back({ReplayKind::Draw, static_cast<std::uint32_t>(replay_draws_.size())});
         replay_draws_.push_back(call);

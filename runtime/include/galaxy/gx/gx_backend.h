@@ -885,8 +885,11 @@ private:
     void write_scene_vs_constants(const GxVsConstants& cpu, GxVsConstants& upload);
     // Writes the jittered projection of a perspective draw into `upload`;
     // `jitter_ndc` receives the offset (zero for orthographic draws).
-    void apply_scene_jitter(const GxVsConstants& cpu, GxVsConstants& upload,
-                            float jitter_ndc[2]);
+void apply_scene_jitter(const GxVsConstants& cpu, GxVsConstants& upload,
+                        float jitter_ndc[2]);
+    // Hands the scene's view-projection matrix and clip planes to the renderer
+    // once, for the ray-query pass. Latched only after usable planes arrive.
+    void capture_scene_projection(const GxVsConstants& cpu);
     void adopt_pointer_depth_fence_if_needed();
     // Asynchronous EFB depth field for simulation-thread GXPeekZ. Three slots: the render owner fills the
     // slot after the published one, then publishes it. Readers only load the published slot. One set per
@@ -1184,6 +1187,13 @@ private:
     D3D12_GPU_DESCRIPTOR_HANDLE current_sampler_table_{};
     D3D12_GPU_VIRTUAL_ADDRESS current_matrix_palette_ = 0;
     bool matrix_palette_stale_ = true;
+    // World transform of the geometry currently being drawn, kept on the CPU so
+    // the acceleration-structure path can use it as a top-level instance
+    // transform. Only meaningful when scene_transform_known_ is set, which
+    // excludes per-vertex palette draws whose position matrix is chosen per
+    // vertex.
+    Affine34 scene_transform_ = affine_identity();
+    bool scene_transform_known_ = false;
     // Requirement of the last resolved VS. A palette-free draw can reuse its
     // bindings while retaining stale palette debt for a later palette user.
     bool current_palette_required_ = true;

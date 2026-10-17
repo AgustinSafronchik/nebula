@@ -53,6 +53,11 @@
 
 namespace galaxy::gx {
 
+// Exposed so the renderer's DXR measurement can report how a scene's draws
+// split between per-vertex palettes and a single inline position matrix.
+std::uint64_t g_dxr_record_palette = 0;
+std::uint64_t g_dxr_record_inline = 0;
+
 std::uint32_t pack_sampler_key(
     const TexMode& mode,
     bool generated_mips,
@@ -6228,8 +6233,49 @@ void GxBackend::attach_pointer_depth_capture(
 // A perspective draw in the temporal scene: the clip-space offset that moves
 // the image by the scene jitter in render pixels at this draw's viewport.
 // The first such draw also supplies the camera planes and field of view.
+void GxBackend::capture_scene_projection(const GxVsConstants& cpu) {
+    if (scene_camera_captured_) {
+        return;
+    }
+    const auto xf_float = [this](unsigned offset) {
+        return std::bit_cast<float>(state_.xf(static_cast<std::uint16_t>(offset)));
+    };
+    // Deliberately not gated on the projection type register. The ray-query
+    // pass only needs an invertible view-projection and a ray range, so it does
+    // not care whether the scene is perspective or orthographic. The earlier
+    // type check required 0 and therefore never fired on this game.
+    //
+    // The matrix is the vertex shader's own constant block, copied verbatim:
+    // the uber vertex shader computes `o.pos = mul(projection, wpos)`, so this
+    // is the full view-projection already. Reconstructing it from the six GX
+    // projection registers instead produces a singular matrix.
+    float matrix[16]{};
+    for (unsigned index = 0; index < 16u; ++index) {
+        matrix[index] = cpu.projection[index / 4u][index % 4u];
+    }
+    if (!renderer_.set_scene_projection(matrix)) {
+        return;
+    }
+    // Range taken from the projection's depth parameters when they are usable,
+    // otherwise the renderer's defaults, which are wide enough for a first
+    // traced image.
+    const float c = xf_float(xf::kProjectionBase + 2u);
+    const float e = xf_float(xf::kProjectionBase + 4u);
+    const float f = xf_float(xf::kProjectionBase + 5u);
+    const float near_plane = f / (e - 1.0f);
+    const float far_plane = f / e;
+    const float fov_y = c != 0.0f ? 2.0f * std::atan(1.0f / std::fabs(c)) : 1.0f;
+    if (std::isfinite(near_plane) && std::isfinite(far_plane) &&
+        far_plane > near_plane) {
+        renderer_.set_scene_camera(near_plane, far_plane, fov_y);
+    }
+    scene_camera_captured_ = true;
+    std::cerr << "[dxr-camera] captured near=" << near_plane << " far=" << far_plane
+              << std::endl;
+}
+
 void GxBackend::apply_scene_jitter(const GxVsConstants& cpu, GxVsConstants& upload,
-                                   float jitter_ndc[2]) {
+                                    float jitter_ndc[2]) {
     jitter_ndc[0] = 0.0f;
     jitter_ndc[1] = 0.0f;
     if (state_.xf(static_cast<std::uint16_t>(xf::kProjectionBase + 6u)) != 0u) {
@@ -6253,20 +6299,6 @@ void GxBackend::apply_scene_jitter(const GxVsConstants& cpu, GxVsConstants& uplo
         upload.projection[0][column] = cpu.projection[0][column] + jx * cpu.projection[3][column];
         upload.projection[1][column] = cpu.projection[1][column] + jy * cpu.projection[3][column];
     }
-    if (!scene_camera_captured_) {
-        scene_camera_captured_ = true;
-        // GX perspective: clip z = E z + F, w = -z; NDC z -1 at near, 0 at far.
-        const float c = xf_float(xf::kProjectionBase + 2u);
-        const float e = xf_float(xf::kProjectionBase + 4u);
-        const float f = xf_float(xf::kProjectionBase + 5u);
-        const float near_plane = f / (e - 1.0f);
-        const float far_plane = f / e;
-        const float fov_y = c != 0.0f ? 2.0f * std::atan(1.0f / std::fabs(c)) : 1.0f;
-        if (std::isfinite(near_plane) && std::isfinite(far_plane) &&
-            near_plane > 0.0f && far_plane > near_plane) {
-            renderer_.set_scene_camera(near_plane, far_plane, fov_y);
-        }
-    }
 }
 
 // One VS constant upload inside a temporal scene. Palettes are addressed
@@ -6277,6 +6309,11 @@ void GxBackend::write_scene_vs_constants(const GxVsConstants& cpu, GxVsConstants
     if (temporal_scene_) {
         apply_scene_jitter(cpu, upload, jitter_ndc);
     }
+    // Unconditional: the ray-query pass needs the camera whether or not the
+    // scene is temporally upscaled. It used to sit inside apply_scene_jitter,
+    // which only runs for temporal scenes, so on a plain scene the projection
+    // never reached the renderer and the traced pass stayed disabled.
+    capture_scene_projection(cpu);
     const D3D12_GPU_VIRTUAL_ADDRESS ring_base = renderer_.matrix_ring().gpu_base();
     const std::uint32_t palette_offset = current_matrix_palette_ != 0u
         ? static_cast<std::uint32_t>((current_matrix_palette_ - ring_base) / 16u)
@@ -6298,8 +6335,16 @@ void GxBackend::write_scene_vs_constants(const GxVsConstants& cpu, GxVsConstants
         // PNMTX0 (XF rows 0-2) stands for the per-vertex palette's object.
         for (unsigned i = 0; i < 12u; ++i) record.position[i] = xf_float(i);
         record.palette_offset = palette_offset;
+        // Per-vertex palette draws pick their position matrix through a
+        // per-vertex index, so there is no single world transform to hand the
+        // acceleration structures. They stay out of them.
+        scene_transform_known_ = false;
+        ++g_dxr_record_palette;
     } else {
         std::memcpy(record.position.data(), cpu.inline_pos_matrix, sizeof(record.position));
+        scene_transform_ = record.position;
+        scene_transform_known_ = true;
+        ++g_dxr_record_inline;
     }
     record.translation[0] = record.position[3];
     record.translation[1] = record.position[7];
@@ -7987,7 +8032,7 @@ void GxBackend::present_cached_xfb_on_thread(
     if (!snapshot_path.empty()) {
         renderer_.set_debug_capture_paths({}, snapshot_path);
     }
-    renderer_.begin_frame(true);
+    renderer_.begin_frame(true, FrameKind::PresentOnly);
     // Present-only frames do not acquire or resize XFB textures. Keep
     // EfbCopyManager retirement/recycling tied to render frames that can
     // actually produce GXCopyDisp resources; otherwise the split
@@ -7997,7 +8042,7 @@ void GxBackend::present_cached_xfb_on_thread(
     if (!snapshot_path.empty()) {
         renderer_.set_debug_capture_paths({}, {});
     }
-    renderer_.end_frame();
+    renderer_.end_frame(true, nullptr, nullptr, FrameKind::PresentOnly);
     if (capture_present) {
         renderer_.set_debug_capture_paths({}, {});
         std::cerr << "[gx-present-capture] request=" << present_requests
@@ -8173,7 +8218,7 @@ void GxBackend::render_frame_on_thread(FrameChunk& chunk) {
                 current_pipeline_ = nullptr;
             }
         }
-        renderer_.begin_frame(chunk.present_swap_chain);
+        renderer_.begin_frame(chunk.present_swap_chain, FrameKind::Render);
         {
             // Interpolated redraw: present rate above 60 with the temporal
             // upscaler off. Decided per render chunk.
@@ -8950,7 +8995,8 @@ void GxBackend::render_frame_on_thread(FrameChunk& chunk) {
             // One nonblocking poll can retire ready work before Present waits.
             context.backend->poll_completed_frame_effects();
         },
-        &submission_context);
+        &submission_context,
+        FrameKind::Render);
     if (chunk.present_swap_chain && present_swap_chain &&
         selected_xfb != nullptr) {
         present_epoch_ = current_present_epoch;
@@ -10291,9 +10337,32 @@ ID3D12PipelineState* GxBackend::flush_draw_state(
             : std::chrono::steady_clock::time_point{};
         const GxVsConstants& vs_c = cpu_vs_constants_.update(
             state_, dirty, renderer_.efb_scale(), frame_bindings_dirty_);
+        // Capture the draw's world transform for the acceleration-structure
+        // path. vs_c.inline_pos_matrix is the position matrix the vertex shader
+        // uses when the draw has no per-vertex palette, which is exactly the
+        // case a single top-level instance transform can represent.
+        //
+        // has_pn_matrix_index is the palette case: the position matrix is then
+        // selected per vertex, so there is no single world transform and the
+        // draw is left out of the acceleration structures.
+        if (vs_key_.flags & 0x01u) {
+            scene_transform_known_ = false;
+            ++g_dxr_record_palette;
+        } else {
+            std::memcpy(scene_transform_.data(), vs_c.inline_pos_matrix,
+                        sizeof(scene_transform_));
+            scene_transform_known_ = true;
+            ++g_dxr_record_inline;
+        }
         UploadRing::Allocation vs_alloc =
             renderer_.constant_ring().allocate(sizeof(GxVsConstants), 256u);
         std::memcpy(vs_alloc.cpu, &vs_c, sizeof(vs_c));
+        // Unconditional, unlike write_scene_vs_constants above, which only runs
+        // for history scenes: the ray-query pass needs the camera on a plain
+        // scene too. This block runs whenever the frame's vertex constants are
+        // refreshed, so the camera arrives without depending on temporal or
+        // history playback.
+        capture_scene_projection(vs_c);
         if (history_scene_) [[unlikely]] {
             write_scene_vs_constants(vs_c, *reinterpret_cast<GxVsConstants*>(vs_alloc.cpu));
         }
@@ -10716,6 +10785,8 @@ bool GxBackend::begin_cached_draw_run(
             ? current_sampler_table_
             : renderer_.default_sampler_table();
     cached_draw_run_state_call_.matrix_palette = draw_matrix_palette_;
+    cached_draw_run_state_call_.world_transform = scene_transform_;
+    cached_draw_run_state_call_.traceable = scene_transform_known_;
     cached_draw_run_state_call_.aux_target     = current_pipeline_aux_;
     cached_draw_run_state_call_.replay_record  = current_replay_record_;
     cached_draw_run_state_call_.topology       = topology;
@@ -11392,6 +11463,14 @@ bool GxBackend::on_cached_packet_draw_run(
     call.vertex_view = vbv;
     call.index_view = ibv;
     call.index_count = prim.index_count;
+    // cached_draw_run_state_call_ already carries the batch's transform; only
+    // the very first primitive of a batch sets it, and later primitives share
+    // it because batching requires identical vs_constants. The batch is only
+    // traceable if every primitive in it uses one position matrix.
+    call.traceable = call.traceable &&
+                     prim.single_position_matrix &&
+                     prim.index_count >= 3u &&
+                     call.topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 
     const std::size_t vertex_byte_end =
         prim.vertex_byte_offset +
@@ -11809,6 +11888,16 @@ void GxBackend::on_draw(
     call.vertex_view    = vbv;
     call.index_view     = ibv;
     call.index_count    = prim.index_count;
+    call.world_transform = scene_transform_;
+    // Triangle lists become acceleration-structure geometry whenever one world
+    // transform describes the whole draw. Triangle draws are usually
+    // non-indexed (indices are implicit 0,1,2,...), which the acceleration
+    // structure path serves from one shared sequential index buffer, so
+    // indexed-ness is deliberately not part of this test.
+    call.traceable = scene_transform_known_ &&
+                     prim.single_position_matrix &&
+                     prim.index_count >= 3u &&
+                     topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 
     TexImage tex0{};
     TevOrder ord0{};

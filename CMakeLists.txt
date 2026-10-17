@@ -659,15 +659,44 @@ foreach(galaxy_smaa_preset LOW MEDIUM HIGH ULTRA)
         PASS_SMAA_WEIGHTS SMAA_PRESET_${galaxy_smaa_preset} smaa ps_5_0 PSMain)
 endforeach()
 
+# The inline ray-query pass is compiled by dxc, not fxc: RayQuery has no DXBC
+# equivalent and D3D12 needs the DXIL container. dxc is not vendored here, so it
+# is looked up in third_party/dxc first and then on PATH; configure fails with a
+# clear message if neither has it, which is better than silently skipping the
+# shader and leaving the header empty.
+find_program(GALAXY_DXC dxc
+    HINTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/dxc"
+    REQUIRED)
+set(galaxy_dxr_dir "${CMAKE_CURRENT_BINARY_DIR}/generated/dxr_shaders")
+file(MAKE_DIRECTORY "${galaxy_dxr_dir}")
+set(galaxy_dxr_rq_hlsl "${CMAKE_CURRENT_SOURCE_DIR}/runtime/src/gx/dxr_rayquery.hlsl")
+set(galaxy_dxr_embed "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary.cmake")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${galaxy_dxr_rq_hlsl}")
+set(galaxy_dxr_rq_dxil "${galaxy_dxr_dir}/dxr_rayquery_cs.dxil")
+set(galaxy_dxr_rq_header "${galaxy_dxr_dir}/dxr_rayquery_cs.h")
+# cs_6_5 is the first model where dxc accepts the RayQuery opcodes.
+add_custom_command(OUTPUT "${galaxy_dxr_rq_header}"
+    COMMAND "${GALAXY_DXC}" -T cs_6_5 -E CSMain -Ges -Fo "${galaxy_dxr_rq_dxil}"
+        "${galaxy_dxr_rq_hlsl}"
+    COMMAND "${CMAKE_COMMAND}" -DINPUT=${galaxy_dxr_rq_dxil}
+        -DOUTPUT=${galaxy_dxr_rq_header} -DSYMBOL=g_dxr_rayquery_cs_dxil
+        -P "${galaxy_dxr_embed}"
+    DEPENDS "${galaxy_dxr_rq_hlsl}" "${galaxy_dxr_embed}"
+    COMMENT "Compiling inline ray-query pass to DXIL"
+    VERBATIM)
+set_source_files_properties("${galaxy_dxr_rq_header}" PROPERTIES GENERATED TRUE HEADER_FILE_ONLY TRUE)
+
 # galaxy_gx: static lib used by NebulaRuntime and the renderer tests.
 # The public API (gx_d3d12.h) is implemented by gx_shim.cpp over GxBackend.
 add_library(galaxy_gx STATIC
+    "${galaxy_dxr_rq_header}"
     runtime/src/gx/gx_shim.cpp
     runtime/src/gx/gx_headers_compile.cpp
     runtime/src/gx/gx_state.cpp
     runtime/src/gx/frame_completion.cpp
     runtime/src/gx/render_config.cpp
     runtime/src/gx/renderer_d3d12.cpp
+    runtime/src/gx/dxr_capture.cpp
     runtime/src/gx/window_owner.cpp
     runtime/src/gx/texture_cache.cpp
     runtime/src/gx/placed_texture_allocator.cpp
@@ -720,6 +749,7 @@ target_compile_definitions(
 target_include_directories(galaxy_gx
     PRIVATE
         "${galaxy_post_dir}"
+        "${galaxy_dxr_dir}"
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/smaa"
 )
 if(MSVC)

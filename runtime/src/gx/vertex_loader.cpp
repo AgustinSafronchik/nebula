@@ -24,6 +24,7 @@
 #include <emmintrin.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <bit>
 #include <cassert>
@@ -37,6 +38,95 @@
 #include <utility>
 
 namespace galaxy::gx {
+
+namespace {
+VertexLoaderDiagnostics g_vertex_loader_diagnostics{};
+
+bool vertex_loader_diagnostics_enabled() {
+    static const bool enabled = [] {
+        char value[16]{};
+        std::size_t length = 0;
+        return getenv_s(&length, value, sizeof(value), "GALAXY_DXR_MEASURE") == 0 &&
+               length > 1 && value[0] == '1';
+    }();
+    return enabled;
+}
+}  // namespace
+
+VertexLoaderDiagnostics vertex_loader_diagnostics() noexcept {
+    return g_vertex_loader_diagnostics;
+}
+
+void reset_vertex_loader_diagnostics() noexcept {
+    g_vertex_loader_diagnostics = {};
+}
+
+// A primitive whose vertices all reference one position/normal matrix maps to
+// a single rigid world transform, so it can become one BLAS plus one TLAS
+// instance. Anything above one distinct index would need the vertices
+// pre-transformed or the primitive left out of the acceleration structures.
+// Scans a decoded vertex range for the position/normal matrix index
+// (GxVertexOut::mtx_indices[0], low byte). Reports whether every vertex agrees,
+// which is what decides if one world transform covers the whole primitive.
+static std::pair<bool, std::uint8_t> scan_position_matrix(
+    const GxVertexOut* vertices, std::uint32_t vertex_count) noexcept {
+    if (vertex_count == 0u) {
+        return {true, 0u};
+    }
+    const auto first = static_cast<std::uint8_t>(vertices[0].mtx_indices[0] & 0xFFu);
+    for (std::uint32_t i = 1; i < vertex_count; ++i) {
+        if (static_cast<std::uint8_t>(vertices[i].mtx_indices[0] & 0xFFu) != first) {
+            return {false, first};
+        }
+    }
+    return {true, first};
+}
+
+void note_vertex_loader_primitive(
+    const GxVertexOut* vertices, std::uint32_t vertex_count,
+    std::uint32_t index_count) noexcept {
+    if (!vertex_loader_diagnostics_enabled()) {
+        return;
+    }
+    auto& counters = g_vertex_loader_diagnostics;
+    ++counters.primitives;
+    counters.vertices += vertex_count;
+    counters.indices += index_count;
+
+    std::uint8_t seen[256]{};
+    std::uint32_t distinct = 0;
+    for (std::uint32_t i = 0; i < vertex_count; ++i) {
+        const auto matrix = static_cast<std::uint8_t>(vertices[i].mtx_indices[0] & 0xFFu);
+        if (seen[matrix] == 0u) {
+            seen[matrix] = 1u;
+            ++distinct;
+        }
+    }    if (distinct <= 1u) {
+        ++counters.single_matrix_primitives;
+    } else {
+        ++counters.multi_matrix_primitives;
+    }
+    if (distinct > counters.max_distinct_matrices) {
+        counters.max_distinct_matrices = distinct;
+    }
+    if (distinct <= 8u) {
+        ++counters.matrix_index_histogram[distinct];
+    }
+}
+
+// Same accounting as note_vertex_loader_primitive, for the path that reuses a
+// previously decoded packet run and therefore has no decoded vertex array to
+// scan. Geometry totals are still counted; the matrix histogram is not.
+void note_geometry_only_primitive(std::uint32_t vertex_count,
+                                  std::uint32_t index_count) noexcept {
+    if (!vertex_loader_diagnostics_enabled()) {
+        return;
+    }
+    auto& counters = g_vertex_loader_diagnostics;
+    ++counters.primitives;
+    counters.vertices += vertex_count;
+    counters.indices += index_count;
+}
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -1366,6 +1456,10 @@ LoadedPrimitive VertexLoader::load_with_layout(
         prim.index_count   = 0;
         prim.indexed       = false;
         prim.source_class  = primitive;
+        const auto matrix = scan_position_matrix(verts, prim.vertex_count);
+        prim.single_position_matrix = matrix.first;
+        prim.position_matrix_index = matrix.second;
+        note_vertex_loader_primitive(verts, prim.vertex_count, prim.index_count);
         return prim;
     }
 
@@ -1378,6 +1472,10 @@ LoadedPrimitive VertexLoader::load_with_layout(
         prim.index_count  = max_indices;
         prim.indexed      = false;
         prim.source_class = primitive;
+        const auto matrix = scan_position_matrix(verts, prim.vertex_count);
+        prim.single_position_matrix = matrix.first;
+        prim.position_matrix_index = matrix.second;
+        note_vertex_loader_primitive(verts, prim.vertex_count, prim.index_count);
         return prim;
     }
 
@@ -1408,7 +1506,10 @@ LoadedPrimitive VertexLoader::load_with_layout(
     prim.index_count  = idx_count;
     prim.indexed      = true;
     prim.source_class = primitive;
-
+    const auto matrix = scan_position_matrix(verts, prim.vertex_count);
+    prim.single_position_matrix = matrix.first;
+    prim.position_matrix_index = matrix.second;
+    note_vertex_loader_primitive(verts, prim.vertex_count, prim.index_count);
     return prim;
 }
 
@@ -1692,6 +1793,7 @@ LoadedPrimitive VertexLoader::upload_cached_packet_run_indices(
         prim.index_count = 0;
         prim.indexed = false;
         prim.source_class = primitive;
+        note_geometry_only_primitive(prim.vertex_count, prim.index_count);
         return prim;
     }
 
@@ -1708,6 +1810,7 @@ LoadedPrimitive VertexLoader::upload_cached_packet_run_indices(
         prim.index_count = total_vertices;
         prim.indexed = false;
         prim.source_class = primitive;
+        note_geometry_only_primitive(prim.vertex_count, prim.index_count);
         return prim;
     }
 
@@ -1771,6 +1874,7 @@ LoadedPrimitive VertexLoader::upload_cached_packet_run_indices(
     prim.index_count = idx_count;
     prim.indexed = true;
     prim.source_class = primitive;
+    note_geometry_only_primitive(prim.vertex_count, prim.index_count);
     return prim;
 }
 

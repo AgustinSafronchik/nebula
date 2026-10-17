@@ -26,6 +26,7 @@
 #include <dxgi1_4.h>
 #include <wrl/client.h>
 
+#include "galaxy/gx/dxr_capture.h"
 #include "galaxy/gx/efb_copy.h"
 #include "galaxy/gx/temporal_upscaler.h"
 #include "galaxy/gx/immutable_upload.h"
@@ -355,6 +356,20 @@ struct DrawCall {
     D3D12_VERTEX_BUFFER_VIEW vertex_view{};
     D3D12_INDEX_BUFFER_VIEW index_view{};
     std::uint32_t index_count = 0;
+    // Row-major 3x4 world transform for this draw's geometry, captured on the
+    // CPU alongside the XF state. Bottom-level structures are built in object
+    // space and this matrix becomes the top-level instance transform, so no
+    // vertex pre-transform is needed.
+    //
+    // Batched draws concatenate consecutive primitives that share
+    // vs_constants, and that constant block carries inline_pos_matrix, so one
+    // transform covers the whole batch. The vertex count is likewise
+    // vertex_view.SizeInBytes / vertex_view.StrideInBytes.
+    std::array<float, 12> world_transform{};
+    // False when the draw cannot be traced: per-vertex palette draws select
+    // their position matrix through a per-vertex index that is not resolved
+    // here, so they are left out of the acceleration structures.
+    bool traceable = false;
     D3D12_PRIMITIVE_TOPOLOGY topology =
         D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     D3D12_RECT scissor{};
@@ -370,6 +385,17 @@ struct DrawCall {
     // Interpolated redraw: the scene transform record whose VS constants a
     // sub-frame replaces, -1 for draws outside the 3D scene.
     std::int32_t replay_record = -1;
+};
+
+// Which of the two frame loops is closing. begin_frame()/end_frame() are called
+// on this renderer from two different threads: the render thread, after it has
+// recorded the frame's draws, and the present thread, for a present-only frame
+// that reuses a cached XFB and issues no draws at all. Only Render frames carry
+// geometry, so anything that reads the frame's vertex and index rings (the
+// acceleration-structure capture) must be gated on it.
+enum class FrameKind {
+    Render,       // render thread, after the frame's draws were recorded
+    PresentOnly,  // present thread, cached XFB, no draws
 };
 
 class RendererD3D12 {
@@ -391,7 +417,10 @@ public:
     // and rewinds the slot's ring segments. Swap-chain latency is waited in
     // present(), after GX/EFB work is recorded but before the backbuffer is
     // selected, so gameplay work is not paced by DWM too early.
-    void begin_frame(bool present_swap_chain = true);
+    // kind has no default on purpose: both frame loops call this, and only the
+    // render one carries geometry. Making it required keeps the two call sites
+    // honest about which one they are.
+    void begin_frame(bool present_swap_chain, FrameKind kind);
     // Closes, submits, and signals once the GPU command stream has accepted
     // this frame. Swap-chain presentation is optional and intentionally comes
     // after the resource fence so DWM/display pacing cannot block command
@@ -400,9 +429,10 @@ public:
     // before optional pacing/Present. The context is never retained.
     using SubmissionCallback = void (*)(void* context, std::uint64_t fence_value);
     std::uint64_t end_frame(
-        bool present_swap_chain = true,
-        SubmissionCallback on_submitted = nullptr,
-        void* submission_context = nullptr);
+        bool present_swap_chain,
+        SubmissionCallback on_submitted,
+        void* submission_context,
+        FrameKind kind);
     [[nodiscard]] std::uint64_t completed_fence_value() const;
     // Bounded wait for one exact queue signal. Used only by the explicitly
     // synchronous renderer path; normal async rendering never drains the GPU.
@@ -496,6 +526,12 @@ public:
     }
     // The scene camera's clip planes and vertical field of view (radians).
     void set_scene_camera(float near_plane, float far_plane, float fov_y) noexcept;
+
+    // The scene's view-projection matrix, row-major. The ray-query pass
+    // reconstructs camera rays from its inverse, so the matrix is inverted
+    // here once per capture rather than per pixel. Ignored until the capture
+    // is enabled; the inverse is only maintained when a capture is live.
+    bool set_scene_projection(const float projection[16]) noexcept;
     // GX copy-clear: color from the latched AR/GB regs, depth from z24
     // (converted z24 / 0xFFFFFF into the D24 target).  The clear is scoped to
     // the given rect in unscaled EFB pixels (w==0 -> full target), matching
@@ -515,6 +551,8 @@ public:
         std::uint8_t pixel_format = 0);
 
     void draw(const DrawCall& call);
+    // Temporary DXR feasibility measurement; see renderer_d3d12.cpp.
+    void report_dxr_measurement();
 
     // EFB copy paths (record into the current command list). Both run the
     // conversion blit (intensity / gamma / 3-tap vertical copy filter /
@@ -841,6 +879,10 @@ private:
     bool scene_temporal_ = false;
     float scene_jitter_[2]{};
     float scene_camera_[3]{1.0f, 100000.0f, 1.0f};
+    float scene_inverse_projection_[16]{};
+    bool scene_projection_valid_ = false;
+    unsigned dxr_trace_width_ = 0;
+    unsigned dxr_trace_height_ = 0;
     Microsoft::WRL::ComPtr<ID3D12Resource> motion_target_;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> motion_rtv_heap_;
     D3D12_CPU_DESCRIPTOR_HANDLE motion_rtv_{};
@@ -1045,6 +1087,30 @@ private:
     // by invalidate_gx_bindings() after the ring for the new slot is rewound.
     D3D12_INDEX_BUFFER_VIEW bound_index_view_{};
     bool bound_index_view_valid_ = false;
+
+    // DXR feasibility measurement, enabled by GALAXY_DXR_MEASURE=1.
+    bool dxr_measure_enabled_ = false;
+    std::uint64_t dxr_measure_frames_ = 0;
+    std::uint64_t dxr_measure_draws_ = 0;
+    std::uint64_t dxr_measure_indices_ = 0;
+    std::uint64_t dxr_measure_traced_ = 0;
+    std::uint64_t dxr_measure_traced_indices_ = 0;
+    std::uint64_t dxr_measure_traced_vertices_ = 0;
+    std::uint64_t dxr_measure_palette_draws_ = 0;
+    std::uint64_t dxr_measure_inline_draws_ = 0;
+    // Per-frame acceleration structures. Present until the tracing pass that
+    // consumes them exists; the capture itself is otherwise self-contained.
+    DxrCapture dxr_capture_;
+    bool dxr_capture_ready_ = false;
+    std::uint64_t dxr_capture_frames_ = 0;
+    std::uint64_t dxr_capture_instances_ = 0;
+    std::uint64_t dxr_capture_tris_ = 0;
+    std::uint64_t dxr_capture_skipped_range_ = 0;
+    std::uint64_t dxr_capture_skipped_nan_ = 0;
+    LARGE_INTEGER dxr_capture_qpc_frequency_{};
+    std::uint64_t dxr_capture_draws_seen_ = 0;
+    std::uint64_t dxr_capture_traceable_ = 0;
+    double dxr_capture_build_ms_ = 0.0;
     D3D12_RECT bound_scissor_{};
     // Successful nonempty GX input that produced the currently bound scissor.
     D3D12_RECT bound_scissor_input_{};

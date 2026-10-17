@@ -64,6 +64,12 @@ struct LoadedPrimitive {
     std::uint32_t first_index;      // offset into the frame index ring
     std::uint32_t index_count;      // always a triangle (or line/point) list
     bool indexed;                   // false when DrawInstanced can use vertices directly
+    // True when every vertex of this primitive references the same
+    // position/normal matrix index. Only then does one world transform describe
+    // the whole primitive, which is what the acceleration-structure path needs.
+    // Always true when position_matrix_index is only set for single-matrix runs.
+    bool single_position_matrix = true;
+    std::uint8_t position_matrix_index = 0;
     PrimitiveClass source_class;    // original GX topology, for stats/debug
 };
 
@@ -197,5 +203,25 @@ public:
 private:
     DependencyEventSink* dependency_event_sink_ = nullptr;
 };
+
+// Temporary DXR feasibility instrumentation: how many distinct position/normal
+// matrix indices a single primitive's vertices reference. A primitive with one
+// distinct index can become one BLAS plus one TLAS instance transform; more
+// than one needs the vertices pre-transformed or the primitive excluded.
+struct VertexLoaderDiagnostics {
+    std::uint64_t primitives = 0;
+    std::uint64_t vertices = 0;
+    std::uint64_t indices = 0;
+    std::uint64_t single_matrix_primitives = 0;
+    std::uint64_t multi_matrix_primitives = 0;
+    std::uint64_t max_distinct_matrices = 0;
+    std::uint64_t matrix_index_histogram[9]{};  // [0]=unused, [1..4], [5..8]=5+
+};
+
+[[nodiscard]] VertexLoaderDiagnostics vertex_loader_diagnostics() noexcept;
+void reset_vertex_loader_diagnostics() noexcept;
+void note_vertex_loader_primitive(
+    const GxVertexOut* vertices, std::uint32_t vertex_count,
+    std::uint32_t index_count) noexcept;
 
 }  // namespace galaxy::gx
